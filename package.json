@@ -1,0 +1,19 @@
+{
+  "name": "habitat",
+  "version": "0.1.0",
+  "description": "A tiny Bun and TypeScript CLI named habitat.",
+  "type": "module",
+  "bin": {
+    "habitat": "./bin/habitat"
+  },
+  "scripts": {
+    "start": "bun run ./bin/habitat"
+  },
+  "dependencies": {
+    "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.2"
+  }
+}
