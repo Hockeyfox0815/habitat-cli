@@ -2,12 +2,32 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
 import {
+  advanceConstructionJobs,
+  buildConstructionPlan,
+  cancelConstruction,
+  spendInventory,
+  startConstruction,
+  type BlueprintRecord,
+  type BlueprintOutput,
+  type BlueprintRequiredFacility,
+  type ConstructionPlan,
+  type ConstructionJob,
+  type InventoryStore,
+} from "./construction";
+import { findModuleByReference, getModuleReference } from "./module-refs";
+import {
   getEnergyCostPerTickKwh,
   getModuleCurrentPowerDrawKw,
   getModulePowerState,
   simulatePowerTicks,
   type ModuleRecord,
 } from "./power";
+import {
+  applySolarCharging,
+  formatSolarStatus,
+  type SolarIrradiance,
+  type SolarIrradianceResponse,
+} from "./solar";
 
 type ModuleStore = {
   modules: ModuleRecord[];
@@ -42,35 +62,6 @@ type HabitatRegistrationResponse = {
 
 type HabitatResponse = {
   habitat: Habitat;
-};
-
-type BlueprintOutput = {
-  itemType?: string;
-  moduleType?: string;
-  quantity?: number;
-};
-
-type BlueprintRequiredFacility = {
-  moduleType?: string;
-  minimumLevel?: number;
-};
-
-type BlueprintRecord = {
-  id: string;
-  blueprintId: string;
-  displayName: string;
-  description?: string;
-  status?: string;
-  output?: BlueprintOutput;
-  inputs?: Record<string, number>;
-  productionCost?: Record<string, number>;
-  requiredFacility?: BlueprintRequiredFacility;
-  buildTicks?: number;
-  prerequisites?: string[];
-  unlocks?: string[];
-  repeatable?: boolean;
-  runtimeAttributes?: Record<string, unknown>;
-  capabilities?: string[];
 };
 
 type BlueprintCatalogResponse = {
@@ -127,6 +118,10 @@ function getRegistrationFile() {
 
 function getModuleFile() {
   return join(process.cwd(), ".habitat", "modules.json");
+}
+
+function getInventoryFile() {
+  return join(process.cwd(), ".habitat", "inventory.json");
 }
 
 function getBaseUrl() {
@@ -200,6 +195,34 @@ async function removeModules() {
   await rm(getModuleFile(), { force: true });
 }
 
+async function readInventory() {
+  try {
+    const content = await readFile(getInventoryFile(), "utf8");
+    const store = JSON.parse(content) as InventoryStore;
+    return {
+      resources: store.resources ?? {},
+    } satisfies InventoryStore;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        resources: {},
+      } satisfies InventoryStore;
+    }
+
+    throw error;
+  }
+}
+
+async function writeInventory(inventory: InventoryStore) {
+  const file = getInventoryFile();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(inventory, null, 2)}\n`, "utf8");
+}
+
+async function removeInventory() {
+  await rm(getInventoryFile(), { force: true });
+}
+
 async function readJsonResponse<T>(response: Response) {
   const text = await response.text();
 
@@ -253,6 +276,25 @@ async function keplerCatalogRequest<T>(path: string, notFoundMessage: string, ba
   return readJsonResponse<T>(response);
 }
 
+async function readSolarIrradiance() {
+  const response = await keplerRequest<SolarIrradianceResponse>("/world/solar-irradiance");
+  return response.solarIrradiance;
+}
+
+async function tryReadSolarIrradiance() {
+  try {
+    return {
+      irradiance: await readSolarIrradiance(),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      irradiance: null,
+      error: message,
+    };
+  }
+}
+
 function parseList(value?: string) {
   if (!value) {
     return [];
@@ -297,25 +339,94 @@ function printRegistration(record: RegistrationRecord) {
 }
 
 function printHabitat(habitat: Habitat, moduleCount: number) {
-  writeStdout(`Habitat ID: ${habitat.id}`);
-  writeStdout(`Slug: ${habitat.habitatSlug}`);
-  writeStdout(`Display Name: ${habitat.displayName}`);
-  writeStdout(`Catalog Version: ${habitat.catalogVersion}`);
-  writeStdout(`Status: ${habitat.status}`);
-  writeStdout(`Last Seen At: ${habitat.lastSeenAt ?? "never"}`);
-  writeStdout(`Modules: ${moduleCount}`);
+  const rows = [
+    { label: "Habitat ID", value: habitat.id },
+    { label: "Slug", value: habitat.habitatSlug },
+    { label: "Display Name", value: habitat.displayName },
+    { label: "Catalog Version", value: habitat.catalogVersion },
+    { label: "Status", value: habitat.status },
+    { label: "Last Seen At", value: habitat.lastSeenAt ?? "never" },
+    { label: "Modules", value: `${moduleCount}` },
+  ];
+
+  const labelWidth = Math.max("Field".length, ...rows.map((row) => row.label.length));
+  const valueWidth = Math.max("Value".length, ...rows.map((row) => row.value.length));
+
+  writeStdout(`${"Field".padEnd(labelWidth)}  ${"Value".padEnd(valueWidth)}`);
+  writeStdout(`${"-".repeat(labelWidth)}  ${"-".repeat(valueWidth)}`);
+
+  for (const row of rows) {
+    writeStdout(`${row.label.padEnd(labelWidth)}  ${row.value.padEnd(valueWidth)}`);
+  }
 }
 
-function printModuleSummary(module: ModuleRecord) {
-  writeStdout(`${module.displayName} | blueprint=${module.blueprintId} | id=${module.id} | capabilities=${module.capabilities.length}`);
+function printModuleList(modules: ModuleRecord[]) {
+  const rows = modules.map((module) => {
+    const state = (module.runtimeAttributes as Record<string, unknown>).status;
+
+    return {
+      reference: getModuleReference(modules, module),
+      name: module.displayName,
+      blueprintId: module.blueprintId,
+      state: typeof state === "string" ? state : "offline",
+      capabilities: `${module.capabilities.length}`,
+    };
+  });
+
+  const refWidth = Math.max("Module Ref".length, ...rows.map((row) => row.reference.length));
+  const nameWidth = Math.max("Name".length, ...rows.map((row) => row.name.length));
+  const blueprintWidth = Math.max("Blueprint".length, ...rows.map((row) => row.blueprintId.length));
+  const stateWidth = Math.max("State".length, ...rows.map((row) => row.state.length));
+  const capabilitiesWidth = Math.max("Caps".length, ...rows.map((row) => row.capabilities.length));
+
+  writeStdout("Local modules: module instances currently owned by this habitat.");
+  writeStdout(
+    `${"Module Ref".padEnd(refWidth)}  ${"Name".padEnd(nameWidth)}  ${"Blueprint".padEnd(blueprintWidth)}  ${"State".padEnd(stateWidth)}  ${"Caps".padStart(capabilitiesWidth)}`,
+  );
+  writeStdout(
+    `${"-".repeat(refWidth)}  ${"-".repeat(nameWidth)}  ${"-".repeat(blueprintWidth)}  ${"-".repeat(stateWidth)}  ${"-".repeat(capabilitiesWidth)}`,
+  );
+
+  for (const row of rows) {
+    writeStdout(
+      `${row.reference.padEnd(refWidth)}  ${row.name.padEnd(nameWidth)}  ${row.blueprintId.padEnd(blueprintWidth)}  ${row.state.padEnd(stateWidth)}  ${row.capabilities.padStart(capabilitiesWidth)}`,
+    );
+  }
 }
 
-function printModuleDetails(module: ModuleRecord) {
+function printModuleDetails(module: ModuleRecord, modules: ModuleRecord[]) {
+  const reference = getModuleReference(modules, module);
+  writeStdout(`Reference: ${reference}`);
   writeStdout(`Display Name: ${module.displayName}`);
   writeStdout(`ID: ${module.id}`);
   writeStdout(`Blueprint ID: ${module.blueprintId}`);
   writeStdout(`Connected To: ${module.connectedTo.length === 0 ? "none" : module.connectedTo.join(", ")}`);
   writeStdout(`Capabilities: ${module.capabilities.length === 0 ? "none" : module.capabilities.join(", ")}`);
+  const currentStatus = (module.runtimeAttributes as Record<string, unknown>).status;
+  if (typeof currentStatus === "string") {
+    writeStdout(`State: ${currentStatus}`);
+  }
+  if (module.blueprintId === "basic-battery") {
+    const batteryAttributes = module.runtimeAttributes as Record<string, unknown>;
+    if (typeof batteryAttributes.currentEnergyKwh === "number") {
+      writeStdout(`Battery Energy: ${batteryAttributes.currentEnergyKwh} kWh`);
+    }
+    if (typeof batteryAttributes.energyStorageKwh === "number") {
+      writeStdout(`Battery Capacity: ${batteryAttributes.energyStorageKwh} kWh`);
+    }
+  }
+  if (module.capabilities.includes("solar-generation") || module.blueprintId.includes("solar")) {
+    const solarAttributes = module.runtimeAttributes as Record<string, unknown>;
+    if (typeof solarAttributes.powerGenerationKw === "number") {
+      writeStdout(`Solar Generation: ${solarAttributes.powerGenerationKw} kW`);
+    }
+  }
+  const constructionJob = (module.runtimeAttributes as Record<string, unknown>).constructionJob as ConstructionJob | undefined;
+  if (constructionJob) {
+    writeStdout(`Construction Job: ${constructionJob.blueprintId}`);
+    writeStdout(`Construction Output: ${constructionJob.outputModuleRef}`);
+    writeStdout(`Remaining Ticks: ${constructionJob.remainingTicks}/${constructionJob.buildTicks}`);
+  }
   writeStdout(`Runtime Attributes: ${JSON.stringify(module.runtimeAttributes, null, 2)}`);
 }
 
@@ -332,23 +443,26 @@ function printModulePowerStatus(modules: ModuleRecord[]) {
   const rows = modules.map((module) => {
     const state = getModulePowerState(module);
     const drawKw = getModuleCurrentPowerDrawKw(module);
+    const reference = getModuleReference(modules, module);
 
     return {
+      reference,
       name: module.displayName,
       state,
       drawKw,
     };
   });
 
+  const refWidth = Math.max("Module Ref".length, ...rows.map((row) => row.reference.length));
   const nameWidth = Math.max("Module".length, ...rows.map((row) => row.name.length));
   const stateWidth = Math.max("State".length, ...rows.map((row) => row.state.length));
   const drawWidth = Math.max("Power Draw (kW)".length, ...rows.map((row) => formatNumber(row.drawKw).length));
 
   writeStdout(
-    `${"Module".padEnd(nameWidth)}  ${"State".padEnd(stateWidth)}  ${"Power Draw (kW)".padStart(drawWidth)}`,
+    `${"Module Ref".padEnd(refWidth)}  ${"Module".padEnd(nameWidth)}  ${"State".padEnd(stateWidth)}  ${"Power Draw (kW)".padStart(drawWidth)}`,
   );
   writeStdout(
-    `${"-".repeat(nameWidth)}  ${"-".repeat(stateWidth)}  ${"-".repeat(drawWidth)}`,
+    `${"-".repeat(refWidth)}  ${"-".repeat(nameWidth)}  ${"-".repeat(stateWidth)}  ${"-".repeat(drawWidth)}`,
   );
 
   let totalPowerDrawKw = 0;
@@ -356,7 +470,7 @@ function printModulePowerStatus(modules: ModuleRecord[]) {
   for (const row of rows) {
     totalPowerDrawKw += row.drawKw;
     writeStdout(
-      `${row.name.padEnd(nameWidth)}  ${row.state.padEnd(stateWidth)}  ${formatNumber(row.drawKw).padStart(drawWidth)}`,
+      `${row.reference.padEnd(refWidth)}  ${row.name.padEnd(nameWidth)}  ${row.state.padEnd(stateWidth)}  ${formatNumber(row.drawKw).padStart(drawWidth)}`,
     );
   }
 
@@ -372,6 +486,94 @@ function printModuleStatusChange(module: ModuleRecord) {
   writeStdout(
     `Module ${module.id} is now ${getModulePowerState(module)} (${formatNumber(currentPowerDrawKw)} kW).`,
   );
+}
+
+function printInventory(inventory: InventoryStore) {
+  const entries = Object.entries(inventory.resources).sort(([left], [right]) => left.localeCompare(right));
+
+  if (entries.length === 0) {
+    writeStdout("No local inventory yet.");
+    writeStdout("This is separate from the Kepler resource catalog.");
+    return;
+  }
+
+  writeStdout("Local inventory: resources this habitat currently owns.");
+  const typeWidth = Math.max("Resource Type".length, ...entries.map(([resourceType]) => resourceType.length));
+  const qtyWidth = Math.max("Quantity".length, ...entries.map(([, amount]) => `${amount}`.length));
+
+  writeStdout(`${"Resource Type".padEnd(typeWidth)}  ${"Quantity".padStart(qtyWidth)}`);
+  writeStdout(`${"-".repeat(typeWidth)}  ${"-".repeat(qtyWidth)}`);
+
+  for (const [resourceType, amount] of entries) {
+    writeStdout(`${resourceType.padEnd(typeWidth)}  ${`${amount}`.padStart(qtyWidth)}`);
+  }
+}
+
+function printConstructionPlan(plan: ConstructionPlan, dryRun: boolean) {
+  writeStdout(dryRun ? `Construction dry run for ${plan.blueprintId}` : `Construction checks for ${plan.blueprintId}`);
+  for (const check of plan.checks) {
+    writeStdout(`${check.ok ? "[ok]" : "[x]"} ${check.label}: ${check.details}`);
+  }
+  writeStdout(`Would create: ${plan.outputModuleRef}`);
+  writeStdout(`Resources to spend: ${formatKeyValueRecord(plan.resourcesToSpend)}`);
+  writeStdout(`Build ticks: ${plan.buildTicks}`);
+  writeStdout(`Construction can start: ${plan.canStart ? "yes" : "no"}`);
+}
+
+function printConstructionStatus(modules: ModuleRecord[]) {
+  const facilitiesWithJobs = modules
+    .map((module) => ({
+      module,
+      job: (module.runtimeAttributes as Record<string, unknown>).constructionJob as ConstructionJob | undefined,
+    }))
+    .filter((entry): entry is { module: ModuleRecord; job: ConstructionJob } => Boolean(entry.job));
+
+  if (facilitiesWithJobs.length === 0) {
+    writeStdout("No active construction jobs.");
+    return;
+  }
+
+  const rows = facilitiesWithJobs.map(({ module, job }) => ({
+    facility: getModuleReference(modules, module),
+    blueprintId: job.blueprintId,
+    output: job.outputModuleRef,
+    remaining: `${job.remainingTicks}/${job.buildTicks}`,
+  }));
+
+  const facilityWidth = Math.max("Facility".length, ...rows.map((row) => row.facility.length));
+  const blueprintWidth = Math.max("Blueprint".length, ...rows.map((row) => row.blueprintId.length));
+  const outputWidth = Math.max("Output Module".length, ...rows.map((row) => row.output.length));
+  const remainingWidth = Math.max("Remaining".length, ...rows.map((row) => row.remaining.length));
+
+  writeStdout(
+    `${"Facility".padEnd(facilityWidth)}  ${"Blueprint".padEnd(blueprintWidth)}  ${"Output Module".padEnd(outputWidth)}  ${"Remaining".padEnd(remainingWidth)}`,
+  );
+  writeStdout(
+    `${"-".repeat(facilityWidth)}  ${"-".repeat(blueprintWidth)}  ${"-".repeat(outputWidth)}  ${"-".repeat(remainingWidth)}`,
+  );
+
+  for (const row of rows) {
+    writeStdout(
+      `${row.facility.padEnd(facilityWidth)}  ${row.blueprintId.padEnd(blueprintWidth)}  ${row.output.padEnd(outputWidth)}  ${row.remaining.padEnd(remainingWidth)}`,
+    );
+  }
+}
+
+function printSolarChargeSummary(generatedKwh: number, irradiance?: SolarIrradiance | null, reason?: string) {
+  if (generatedKwh > 0) {
+    const condition = irradiance?.condition ?? "unknown";
+    const irradianceWPerM2 = typeof irradiance?.wPerM2 === "number" ? irradiance.wPerM2 : 0;
+    writeStdout(
+      `Solar charging: generated ${formatNumber(generatedKwh)} kWh this tick run at ${formatNumber(irradianceWPerM2)} W/m2 (${condition}).`,
+    );
+    return;
+  }
+
+  if (reason) {
+    writeStdout(`Solar charging skipped: ${reason}`);
+  } else {
+    writeStdout("Solar charging skipped.");
+  }
 }
 
 function formatKeyValueRecord(values?: Record<string, number>) {
@@ -405,30 +607,41 @@ function formatRequiredFacility(requiredFacility?: BlueprintRequiredFacility) {
 }
 
 function printBlueprintList(blueprints: BlueprintRecord[]) {
+  writeStdout("Kepler blueprint catalog: official buildable blueprint definitions.");
+  writeStdout("These are catalog entries, not local modules your habitat already owns.");
+
   const rows = blueprints.map((blueprint) => ({
     id: blueprint.blueprintId,
     name: blueprint.displayName,
+    output: formatBlueprintOutput(blueprint.output),
     facility: formatRequiredFacility(blueprint.requiredFacility),
     ticks: `${blueprint.buildTicks ?? 0}`,
+    status: blueprint.status ?? "unknown",
   }));
 
   const idWidth = Math.max("Blueprint ID".length, ...rows.map((row) => row.id.length));
   const nameWidth = Math.max("Name".length, ...rows.map((row) => row.name.length));
+  const outputWidth = Math.max("Output".length, ...rows.map((row) => row.output.length));
   const facilityWidth = Math.max("Facility".length, ...rows.map((row) => row.facility.length));
   const ticksWidth = Math.max("Ticks".length, ...rows.map((row) => row.ticks.length));
+  const statusWidth = Math.max("Status".length, ...rows.map((row) => row.status.length));
+  const topBorder = `┌${"─".repeat(idWidth + 2)}┬${"─".repeat(nameWidth + 2)}┬${"─".repeat(outputWidth + 2)}┬${"─".repeat(facilityWidth + 2)}┬${"─".repeat(ticksWidth + 2)}┬${"─".repeat(statusWidth + 2)}┐`;
+  const headerDivider = `├${"─".repeat(idWidth + 2)}┼${"─".repeat(nameWidth + 2)}┼${"─".repeat(outputWidth + 2)}┼${"─".repeat(facilityWidth + 2)}┼${"─".repeat(ticksWidth + 2)}┼${"─".repeat(statusWidth + 2)}┤`;
+  const rowDivider = headerDivider;
+  const bottomBorder = `└${"─".repeat(idWidth + 2)}┴${"─".repeat(nameWidth + 2)}┴${"─".repeat(outputWidth + 2)}┴${"─".repeat(facilityWidth + 2)}┴${"─".repeat(ticksWidth + 2)}┴${"─".repeat(statusWidth + 2)}┘`;
 
+  writeStdout(topBorder);
   writeStdout(
-    `${"Blueprint ID".padEnd(idWidth)}  ${"Name".padEnd(nameWidth)}  ${"Facility".padEnd(facilityWidth)}  ${"Ticks".padStart(ticksWidth)}`,
+    `│ ${"Blueprint ID".padEnd(idWidth)} │ ${"Name".padEnd(nameWidth)} │ ${"Output".padEnd(outputWidth)} │ ${"Facility".padEnd(facilityWidth)} │ ${"Ticks".padStart(ticksWidth)} │ ${"Status".padEnd(statusWidth)} │`,
   );
-  writeStdout(
-    `${"-".repeat(idWidth)}  ${"-".repeat(nameWidth)}  ${"-".repeat(facilityWidth)}  ${"-".repeat(ticksWidth)}`,
-  );
+  writeStdout(headerDivider);
 
-  for (const row of rows) {
+  rows.forEach((row, index) => {
     writeStdout(
-      `${row.id.padEnd(idWidth)}  ${row.name.padEnd(nameWidth)}  ${row.facility.padEnd(facilityWidth)}  ${row.ticks.padStart(ticksWidth)}`,
+      `│ ${row.id.padEnd(idWidth)} │ ${row.name.padEnd(nameWidth)} │ ${row.output.padEnd(outputWidth)} │ ${row.facility.padEnd(facilityWidth)} │ ${row.ticks.padStart(ticksWidth)} │ ${row.status.padEnd(statusWidth)} │`,
     );
-  }
+    writeStdout(index === rows.length - 1 ? bottomBorder : rowDivider);
+  });
 }
 
 function printBlueprintDetails(blueprint: BlueprintRecord) {
@@ -489,7 +702,7 @@ async function requireRegistration() {
 }
 
 function findModule(modules: ModuleRecord[], displayName: string) {
-  return modules.find((module) => module.displayName === displayName);
+  return findModuleByReference(modules, displayName);
 }
 
 program
@@ -586,6 +799,7 @@ program
     await keplerRequest(`/habitats/${record.habitatId}`, { method: "DELETE" }, record.baseUrl);
     await removeRegistration();
     await removeModules();
+    await removeInventory();
     writeStdout(`Unregistered "${record.displayName}" from Kepler.`);
   });
 
@@ -603,10 +817,21 @@ program
     }
 
     let modules = await readModules();
+    const completedModules: string[] = [];
+    const solarRead = await tryReadSolarIrradiance();
+    let totalSolarGenerationKwh = 0;
+    let solarSkipReason = solarRead.error ? `unable to read Kepler solar irradiance. ${solarRead.error}` : undefined;
 
     for (let tick = 0; tick < parsedCount; tick += 1) {
-      const result = simulatePowerTicks(modules, 1);
-      modules = result.modules;
+      const powerResult = simulatePowerTicks(modules, 1);
+      const constructionResult = advanceConstructionJobs(powerResult.modules, powerResult.poweredModuleIds);
+      const solarResult = applySolarCharging(constructionResult.modules, solarRead.irradiance);
+      modules = solarResult.modules;
+      totalSolarGenerationKwh += solarResult.generatedKwh;
+      if (!solarSkipReason && solarResult.reason) {
+        solarSkipReason = solarResult.reason;
+      }
+      completedModules.push(...constructionResult.completedModules);
     }
 
     await writeModules(modules);
@@ -619,6 +844,12 @@ program
 
     if (batteryModule && typeof batteryModule.runtimeAttributes.currentEnergyKwh === "number") {
       writeStdout(`Battery energy: ${batteryModule.runtimeAttributes.currentEnergyKwh} kWh`);
+    }
+
+    printSolarChargeSummary(totalSolarGenerationKwh, solarRead.irradiance, solarSkipReason);
+
+    for (const completedModule of completedModules) {
+      writeStdout(`Construction completed: ${completedModule}`);
     }
   });
 
@@ -675,6 +906,109 @@ resourceCommand
     printResourceCatalog(resources);
   });
 
+const solarCommand = program.command("solar").description("Read current Kepler solar conditions.");
+
+solarCommand
+  .command("status")
+  .description("Show current solar irradiance from Kepler.")
+  .action(async () => {
+    const irradiance = await readSolarIrradiance();
+
+    if (!irradiance || typeof irradiance.wPerM2 !== "number") {
+      fail("Kepler did not return a usable solar irradiance reading.");
+    }
+
+    writeStdout(formatSolarStatus(irradiance));
+  });
+
+const inventoryCommand = program.command("inventory").description("Manage local habitat inventory.");
+
+inventoryCommand
+  .command("list")
+  .description("List local inventory resources.")
+  .action(async () => {
+    await requireRegistration();
+    const inventory = await readInventory();
+    printInventory(inventory);
+  });
+
+inventoryCommand
+  .command("add")
+  .description("Add resources to local inventory.")
+  .argument("<resource-type>", "resource type")
+  .argument("<amount>", "resource quantity")
+  .action(async (resourceType: string, amount: string) => {
+    await requireRegistration();
+    const parsedAmount = Number.parseInt(amount, 10);
+
+    if (!Number.isInteger(parsedAmount) || parsedAmount <= 0 || `${parsedAmount}` !== amount.trim()) {
+      fail("Inventory amount must be a positive integer.");
+    }
+
+    const inventory = await readInventory();
+    inventory.resources[resourceType] = (inventory.resources[resourceType] ?? 0) + parsedAmount;
+    await writeInventory(inventory);
+    writeStdout(`Added ${parsedAmount} ${resourceType} to local inventory.`);
+  });
+
+program
+  .command("construct")
+  .description("Start local construction from a Kepler blueprint.")
+  .argument("<blueprint-id>", "blueprint id")
+  .option("--dry-run", "check construction readiness without changing local files")
+  .action(async (blueprintId: string, options: { dryRun?: boolean }) => {
+    await requireRegistration();
+    const [modules, inventory] = await Promise.all([readModules(), readInventory()]);
+    const response = await keplerCatalogRequest<BlueprintResponse>(
+      `/catalog/blueprints/${encodeURIComponent(blueprintId)}`,
+      `Blueprint "${blueprintId}" was not found in the Kepler catalog.`,
+    );
+    const plan = buildConstructionPlan(response.blueprint, modules, inventory);
+
+    printConstructionPlan(plan, Boolean(options.dryRun));
+
+    if (options.dryRun) {
+      return;
+    }
+
+    if (!plan.canStart) {
+      fail("Construction cannot start.");
+    }
+
+    const nextModules = startConstruction(modules, plan);
+    const nextInventory = spendInventory(inventory, plan.resourcesToSpend);
+
+    await writeModules(nextModules);
+    await writeInventory(nextInventory);
+    writeStdout(`Started construction for ${plan.blueprintId}.`);
+    writeStdout(`Facility: ${plan.facilityRef}`);
+    writeStdout(`Output module: ${plan.outputModuleRef}`);
+  });
+
+const constructionCommand = program.command("construction").description("Inspect and manage active construction jobs.");
+
+constructionCommand
+  .command("status")
+  .description("Show active construction jobs.")
+  .action(async () => {
+    await requireRegistration();
+    const modules = await readModules();
+    printConstructionStatus(modules);
+  });
+
+constructionCommand
+  .command("cancel")
+  .description("Cancel an active construction job on a facility.")
+  .argument("<facility-ref>", "construction facility reference")
+  .action(async (facilityRef: string) => {
+    await requireRegistration();
+    const modules = await readModules();
+    const result = cancelConstruction(modules, facilityRef);
+    await writeModules(result.modules);
+    writeStdout(`Canceled construction on ${result.facilityRef}.`);
+    writeStdout(`No materials were refunded. ${result.canceledJob} was not created.`);
+  });
+
 const moduleCommand = program.command("module").description("Manage local habitat modules.");
 
 moduleCommand
@@ -700,7 +1034,7 @@ moduleCommand
   .action(async (moduleId: string, status: string) => {
     await requireRegistration();
     const modules = await readModules();
-    const module = modules.find((item) => item.id === moduleId);
+    const module = findModuleByReference(modules, moduleId);
 
     if (!module) {
       fail(`Module with id "${moduleId}" not found.`);
@@ -753,7 +1087,7 @@ moduleCommand
     modules.push(module);
     await writeModules(modules);
     writeStdout(`Created module "${module.displayName}".`);
-    printModuleDetails(module);
+    printModuleDetails(module, modules);
   });
 
 moduleCommand
@@ -768,9 +1102,7 @@ moduleCommand
       return;
     }
 
-    for (const module of modules) {
-      printModuleSummary(module);
-    }
+    printModuleList(modules);
   });
 
 moduleCommand
@@ -786,7 +1118,7 @@ moduleCommand
       fail(`Module "${displayName}" not found.`);
     }
 
-    printModuleDetails(module);
+    printModuleDetails(module, modules);
   });
 
 moduleCommand
@@ -838,7 +1170,7 @@ moduleCommand
 
     await writeModules(modules);
     writeStdout(`Updated module "${module.displayName}".`);
-    printModuleDetails(module);
+    printModuleDetails(module, modules);
   });
 
 moduleCommand
@@ -848,7 +1180,10 @@ moduleCommand
   .action(async (displayName: string) => {
     await requireRegistration();
     const modules = await readModules();
-    const index = modules.findIndex((module) => module.displayName === displayName);
+    const index = modules.findIndex((module) => {
+      const reference = getModuleReference(modules, module);
+      return module.displayName === displayName || module.id === displayName || reference === displayName;
+    });
 
     if (index === -1) {
       fail(`Module "${displayName}" not found.`);

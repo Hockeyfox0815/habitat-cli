@@ -214,6 +214,46 @@ const catalogBlueprints = [
     unlocks: ["limited-eva"],
     repeatable: true,
   },
+  {
+    id: "blueprint_kepler-442b-v1_small-solar-array",
+    blueprintId: "small-solar-array",
+    displayName: "Small Solar Array Blueprint",
+    description: "Deploys a compact solar power source for the habitat.",
+    status: "published",
+    output: {
+      itemType: "module",
+      moduleType: "small-solar-array",
+      quantity: 1,
+    },
+    inputs: {
+      ferrite: 90,
+      "silicate-glass": 45,
+      "conductive-ore": 18,
+    },
+    productionCost: {
+      power: 4,
+    },
+    requiredFacility: {
+      moduleType: "workshop-fabricator",
+      minimumLevel: 1,
+    },
+    buildTicks: 180,
+    prerequisites: ["life-support"],
+    unlocks: [],
+    repeatable: true,
+    runtimeAttributes: {
+      status: "online",
+      powerGenerationKw: 12,
+      health: 100,
+      powerDrawKw: {
+        offline: 0,
+        online: 0,
+        active: 0,
+        damaged: 0,
+      },
+    },
+    capabilities: ["power-generation"],
+  },
 ];
 
 const catalogResources = [
@@ -235,6 +275,18 @@ const catalogResources = [
     description: "High-value industrial catalyst.",
     category: "specialty",
   },
+  {
+    resourceType: "silicate-glass",
+    displayName: "Silicate Glass",
+    description: "Processed glass panels for habitat construction.",
+    category: "refined",
+  },
+  {
+    resourceType: "conductive-ore",
+    displayName: "Conductive Ore",
+    description: "Electrically useful ore for wiring and power systems.",
+    category: "raw",
+  },
 ];
 
 const habitat = {
@@ -244,6 +296,13 @@ const habitat = {
   catalogVersion: "kepler-442b-v1",
   status: "online",
   lastSeenAt: "2026-07-07T16:00:00.000Z",
+};
+
+const defaultSolarStatus = {
+  solarIrradiance: {
+    wPerM2: 900,
+    condition: "clear",
+  },
 };
 
 let originalFetch: typeof fetch;
@@ -268,7 +327,15 @@ afterAll(() => {
   }
 });
 
-function installMockFetch() {
+function installMockFetch(options?: {
+  solarStatus?: {
+    solarIrradiance?: {
+      wPerM2?: number;
+      condition?: string;
+    };
+  };
+  failSolarStatus?: boolean;
+}) {
   globalThis.fetch = (async (input: Request | URL | string, init?: RequestInit) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
@@ -300,8 +367,25 @@ function installMockFetch() {
       return Response.json({ resources: catalogResources });
     }
 
+    if (request.method === "GET" && url.pathname === "/world/solar-irradiance") {
+      if (options?.failSolarStatus) {
+        return Response.json(
+          {
+            error: "solar_unavailable",
+          },
+          { status: 503 },
+        );
+      }
+
+      return Response.json(options?.solarStatus ?? defaultSolarStatus);
+    }
+
     if (request.method === "GET" && url.pathname === "/catalog/blueprints/basic-battery") {
       return Response.json({ blueprint: catalogBlueprints[0] });
+    }
+
+    if (request.method === "GET" && url.pathname === "/catalog/blueprints/small-solar-array") {
+      return Response.json({ blueprint: catalogBlueprints[2] });
     }
 
     if (request.method === "GET" && url.pathname === "/catalog/blueprints/missing-blueprint") {
@@ -376,7 +460,11 @@ describe("habitat CLI", () => {
 
       const status = await runCommand(["status"]);
       expect(status.exitCode).toBe(0);
-      expect(status.stdout).toContain("Modules: 6");
+      expect(status.stdout).toContain("Field");
+      expect(status.stdout).toContain("Value");
+      expect(status.stdout).toContain("Display Name");
+      expect(status.stdout).toContain("Modules");
+      expect(status.stdout).toContain("6");
 
       const moduleStorePath = join(cwd, ".habitat", "modules.json");
       expect(await readFile(moduleStorePath, "utf8")).toContain("Command Module");
@@ -394,6 +482,10 @@ describe("habitat CLI", () => {
 
       const list = await runCommand(["module", "list"]);
       expect(list.exitCode).toBe(0);
+      expect(list.stdout).toContain("Local modules: module instances currently owned by this habitat.");
+      expect(list.stdout).toContain("Module Ref");
+      expect(list.stdout).toContain("Blueprint");
+      expect(list.stdout).toContain("State");
       expect(list.stdout).toContain("Command Module");
       expect(list.stdout).toContain("Workshop Fabricator");
       expect(list.stdout).toContain("Basic Suitport");
@@ -407,11 +499,18 @@ describe("habitat CLI", () => {
       const result = await runCommand(["blueprint", "list"]);
 
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Blueprint ID");
+      expect(result.stdout).toContain("Kepler blueprint catalog: official buildable blueprint definitions.");
+      expect(result.stdout).toContain("These are catalog entries, not local modules your habitat already owns.");
+      expect(result.stdout).toContain("┌");
+      expect(result.stdout).toContain("│ Blueprint ID");
+      expect(result.stdout).toContain("└");
       expect(result.stdout).toContain("basic-battery");
       expect(result.stdout).toContain("Basic Battery Blueprint");
+      expect(result.stdout).toContain("Output");
+      expect(result.stdout).toContain("1 basic-battery (module)");
       expect(result.stdout).toContain("workshop-fabricator lvl 1");
       expect(result.stdout).toContain("180");
+      expect(result.stdout).toContain("published");
     });
   });
 
@@ -457,6 +556,341 @@ describe("habitat CLI", () => {
       expect(result.stdout).toContain("manufactured");
       expect(result.stdout).toContain("Blueprint requirements may refer to these resource types later.");
       expect(result.stdout).toContain("Local inventory will be tracked separately in habitat files later.");
+    });
+  });
+
+  test("shows current solar irradiance from Kepler", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      const result = await runCommand(["solar", "status"]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Solar irradiance: 900 W/m2 (clear).");
+    });
+  });
+
+  test("supports local inventory add and list", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const emptyList = await runCommand(["inventory", "list"]);
+      expect(emptyList.exitCode).toBe(0);
+      expect(emptyList.stdout).toContain("No local inventory yet.");
+
+      const addFerrite = await runCommand(["inventory", "add", "ferrite", "90"]);
+      expect(addFerrite.exitCode).toBe(0);
+
+      const addGlass = await runCommand(["inventory", "add", "silicate-glass", "45"]);
+      expect(addGlass.exitCode).toBe(0);
+
+      const list = await runCommand(["inventory", "list"]);
+      expect(list.exitCode).toBe(0);
+      expect(list.stdout).toContain("Local inventory: resources this habitat currently owns.");
+      expect(list.stdout).toContain("ferrite");
+      expect(list.stdout).toContain("90");
+      expect(list.stdout).toContain("silicate-glass");
+      expect(list.stdout).toContain("45");
+    });
+  });
+
+  test("construction dry run reports readiness and failing checks", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const failing = await runCommand(["construct", "small-solar-array", "--dry-run"]);
+      expect(failing.exitCode).toBe(0);
+      expect(failing.stdout).toContain("Construction dry run for small-solar-array");
+      expect(failing.stdout).toContain("[ok] Required facility exists");
+      expect(failing.stdout).toContain("[x] Supply cache online");
+      expect(failing.stdout).toContain("[x] Inventory contains resources");
+      expect(failing.stdout).toContain("Would create: small-solar-array-1");
+      expect(failing.stdout).toContain("Construction can start: no");
+
+      await runCommand(["module", "set-status", "supply-cache-1", "online"]);
+      await runCommand(["inventory", "add", "ferrite", "90"]);
+      await runCommand(["inventory", "add", "silicate-glass", "45"]);
+      await runCommand(["inventory", "add", "conductive-ore", "18"]);
+
+      const ready = await runCommand(["construct", "small-solar-array", "--dry-run"]);
+      expect(ready.exitCode).toBe(0);
+      expect(ready.stdout).toContain("[ok] Supply cache online");
+      expect(ready.stdout).toContain("[ok] Inventory contains resources");
+      expect(ready.stdout).toContain("Construction can start: yes");
+    });
+  });
+
+  test("real construction spends inventory, stores an active job, and can be canceled", async () => {
+    installMockFetch();
+
+    await withWorkspace(async (cwd) => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand(["module", "set-status", "supply-cache-1", "online"]);
+      await runCommand(["inventory", "add", "ferrite", "90"]);
+      await runCommand(["inventory", "add", "silicate-glass", "45"]);
+      await runCommand(["inventory", "add", "conductive-ore", "18"]);
+
+      const construct = await runCommand(["construct", "small-solar-array"]);
+      expect(construct.exitCode).toBe(0);
+      expect(construct.stdout).toContain("Started construction for small-solar-array.");
+      expect(construct.stdout).toContain("Facility: workshop-fabricator-1");
+      expect(construct.stdout).toContain("Output module: small-solar-array-1");
+
+      const inventoryPath = join(cwd, ".habitat", "inventory.json");
+      const inventory = await readJson<{ resources: Record<string, number> }>(inventoryPath);
+      expect(inventory.resources.ferrite).toBe(0);
+      expect(inventory.resources["silicate-glass"]).toBe(0);
+      expect(inventory.resources["conductive-ore"]).toBe(0);
+
+      const facilityShow = await runCommand(["module", "show", "workshop-fabricator-1"]);
+      expect(facilityShow.exitCode).toBe(0);
+      expect(facilityShow.stdout).toContain("Reference: workshop-fabricator-1");
+      expect(facilityShow.stdout).toContain("Construction Job: small-solar-array");
+      expect(facilityShow.stdout).toContain("Remaining Ticks: 180/180");
+
+      const constructionStatus = await runCommand(["construction", "status"]);
+      expect(constructionStatus.exitCode).toBe(0);
+      expect(constructionStatus.stdout).toContain("workshop-fabricator-1");
+      expect(constructionStatus.stdout).toContain("small-solar-array");
+      expect(constructionStatus.stdout).toContain("180/180");
+
+      const cancel = await runCommand(["construction", "cancel", "workshop-fabricator-1"]);
+      expect(cancel.exitCode).toBe(0);
+      expect(cancel.stdout).toContain("Canceled construction on workshop-fabricator-1.");
+      expect(cancel.stdout).toContain("No materials were refunded.");
+
+      const afterCancel = await runCommand(["construction", "status"]);
+      expect(afterCancel.exitCode).toBe(0);
+      expect(afterCancel.stdout).toContain("No active construction jobs.");
+
+      const modulesPath = join(cwd, ".habitat", "modules.json");
+      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(modulesPath);
+      expect(moduleStore.modules.map((module) => module.blueprintId)).not.toContain("small-solar-array");
+    });
+  });
+
+  test("construction advances with ticks only when the facility is powered", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand(["module", "set-status", "supply-cache-1", "online"]);
+      await runCommand(["inventory", "add", "ferrite", "90"]);
+      await runCommand(["inventory", "add", "silicate-glass", "45"]);
+      await runCommand(["inventory", "add", "conductive-ore", "18"]);
+      await runCommand(["construct", "small-solar-array"]);
+
+      const firstTick = await runCommand(["tick", "1"]);
+      expect(firstTick.exitCode).toBe(0);
+
+      const statusAfterOne = await runCommand(["construction", "status"]);
+      expect(statusAfterOne.exitCode).toBe(0);
+      expect(statusAfterOne.stdout).toContain("179/180");
+
+      await runCommand(["module", "set-status", "workshop-fabricator-1", "offline"]);
+
+      const pausedTick = await runCommand(["tick", "1"]);
+      expect(pausedTick.exitCode).toBe(0);
+
+      const statusPaused = await runCommand(["construction", "status"]);
+      expect(statusPaused.exitCode).toBe(0);
+      expect(statusPaused.stdout).toContain("179/180");
+    });
+  });
+
+  test("construction completion creates the output module and clears the facility job", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand(["module", "set-status", "supply-cache-1", "online"]);
+      await runCommand(["inventory", "add", "ferrite", "90"]);
+      await runCommand(["inventory", "add", "silicate-glass", "45"]);
+      await runCommand(["inventory", "add", "conductive-ore", "18"]);
+      await runCommand(["construct", "small-solar-array"]);
+
+      const complete = await runCommand(["tick", "180"]);
+      expect(complete.exitCode).toBe(0);
+      expect(complete.stdout).toContain("Construction completed: small-solar-array-1");
+
+      const moduleList = await runCommand(["module", "list"]);
+      expect(moduleList.exitCode).toBe(0);
+      expect(moduleList.stdout).toContain("small-solar-array-1");
+
+      const moduleShow = await runCommand(["module", "show", "small-solar-array-1"]);
+      expect(moduleShow.exitCode).toBe(0);
+      expect(moduleShow.stdout).toContain("Reference: small-solar-array-1");
+      expect(moduleShow.stdout).toContain("Blueprint ID: small-solar-array");
+      expect(moduleShow.stdout).toContain('"powerGenerationKw": 12');
+
+      const facilityShow = await runCommand(["module", "show", "workshop-fabricator-1"]);
+      expect(facilityShow.exitCode).toBe(0);
+      expect(facilityShow.stdout).not.toContain("Construction Job:");
+
+      const constructionStatus = await runCommand(["construction", "status"]);
+      expect(constructionStatus.exitCode).toBe(0);
+      expect(constructionStatus.stdout).toContain("No active construction jobs.");
+    });
+  });
+
+  test("solar charging increases online battery charge when an online solar module exists", async () => {
+    installMockFetch();
+
+    await withWorkspace(async (cwd) => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand([
+        "module",
+        "create",
+        "--name",
+        "small-solar-array-1",
+        "--blueprint-id",
+        "small-solar-array",
+        "--runtime-attributes",
+        '{"status":"online","powerGenerationKw":12,"powerDrawKw":{"offline":0,"online":0,"active":0,"damaged":0}}',
+        "--capabilities",
+        "solar-generation",
+      ]);
+
+      const moduleStorePath = join(cwd, ".habitat", "modules.json");
+      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
+
+      for (const module of moduleStore.modules) {
+        if (["Command Module", "Life Support", "Workshop Fabricator", "Basic Suitport", "Supply Cache"].includes(module.displayName)) {
+          module.runtimeAttributes.status = "offline";
+        }
+
+        if (module.displayName === "Basic Battery") {
+          module.runtimeAttributes.status = "online";
+          module.runtimeAttributes.currentEnergyKwh = 499;
+        }
+      }
+
+      await writeJson(moduleStorePath, moduleStore);
+
+      const tick = await runCommand(["tick", "1"]);
+      expect(tick.exitCode).toBe(0);
+      expect(tick.stdout).toContain("Solar charging: generated 0.001667 kWh");
+
+      const updatedStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
+      const battery = updatedStore.modules.find((module) => module.displayName === "Basic Battery");
+      expect(battery).toBeDefined();
+      expect((battery as ModuleRecord).runtimeAttributes.currentEnergyKwh).toBeCloseTo(499.00166666666667, 12);
+    });
+  });
+
+  test("solar charging is skipped when the battery is offline", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand([
+        "module",
+        "create",
+        "--name",
+        "small-solar-array-1",
+        "--blueprint-id",
+        "small-solar-array",
+        "--runtime-attributes",
+        '{"status":"online","powerGenerationKw":12,"powerDrawKw":{"offline":0,"online":0,"active":0,"damaged":0}}',
+        "--capabilities",
+        "solar-generation",
+      ]);
+
+      const tick = await runCommand(["tick", "1"]);
+      expect(tick.exitCode).toBe(0);
+      expect(tick.stdout).toContain("Solar charging skipped: No online battery modules could receive charge.");
+    });
+  });
+
+  test("solar charging is skipped when irradiance is zero", async () => {
+    installMockFetch({
+      solarStatus: {
+        solarIrradiance: {
+          wPerM2: 0,
+          condition: "night",
+        },
+      },
+    });
+
+    await withWorkspace(async (cwd) => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand([
+        "module",
+        "create",
+        "--name",
+        "small-solar-array-1",
+        "--blueprint-id",
+        "small-solar-array",
+        "--runtime-attributes",
+        '{"status":"online","powerGenerationKw":12,"powerDrawKw":{"offline":0,"online":0,"active":0,"damaged":0}}',
+        "--capabilities",
+        "solar-generation",
+      ]);
+
+      const moduleStorePath = join(cwd, ".habitat", "modules.json");
+      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
+      for (const module of moduleStore.modules) {
+        if (module.displayName === "Basic Battery") {
+          module.runtimeAttributes.status = "online";
+          module.runtimeAttributes.currentEnergyKwh = 499;
+        }
+      }
+      await writeJson(moduleStorePath, moduleStore);
+
+      const tick = await runCommand(["tick", "1"]);
+      expect(tick.exitCode).toBe(0);
+      expect(tick.stdout).toContain("Solar charging skipped: Solar irradiance is zero, so no charging happened.");
+    });
+  });
+
+  test("solar charging is skipped when the battery is already full", async () => {
+    installMockFetch();
+
+    await withWorkspace(async (cwd) => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      await runCommand(["module", "set-status", "basic-battery-1", "online"]);
+      await runCommand([
+        "module",
+        "create",
+        "--name",
+        "small-solar-array-1",
+        "--blueprint-id",
+        "small-solar-array",
+        "--runtime-attributes",
+        '{"status":"online","powerGenerationKw":12,"powerDrawKw":{"offline":0,"online":0,"active":0,"damaged":0}}',
+        "--capabilities",
+        "solar-generation",
+      ]);
+
+      const moduleStorePath = join(cwd, ".habitat", "modules.json");
+      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
+      for (const module of moduleStore.modules) {
+        if (["Command Module", "Life Support", "Workshop Fabricator", "Basic Suitport", "Supply Cache"].includes(module.displayName)) {
+          module.runtimeAttributes.status = "offline";
+        }
+      }
+      await writeJson(moduleStorePath, moduleStore);
+
+      const tick = await runCommand(["tick", "1"]);
+      expect(tick.exitCode).toBe(0);
+      expect(tick.stdout).toContain("Solar charging skipped: Battery storage is already full.");
+    });
+  });
+
+  test("tick continues when Kepler solar status fails", async () => {
+    installMockFetch({ failSolarStatus: true });
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const tick = await runCommand(["tick", "1"]);
+      expect(tick.exitCode).toBe(0);
+      expect(tick.stdout).toContain("Ran 1 tick.");
+      expect(tick.stdout).toContain("Solar charging skipped: unable to read Kepler solar irradiance.");
     });
   });
 
@@ -640,6 +1074,7 @@ describe("habitat CLI", () => {
       expect(unregister.stdout).toContain('Unregistered "Adrians Land" from Kepler.');
       await expect(readFile(join(cwd, ".habitat", "registration.json"), "utf8")).rejects.toThrow();
       await expect(readFile(join(cwd, ".habitat", "modules.json"), "utf8")).rejects.toThrow();
+      await expect(readFile(join(cwd, ".habitat", "inventory.json"), "utf8")).rejects.toThrow();
     });
   });
 

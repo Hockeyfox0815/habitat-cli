@@ -19,6 +19,7 @@ type PowerTickResult = {
   modules: ModuleRecord[];
   batteryEnergyKwh: number;
   poweredModuleNames: string[];
+  poweredModuleIds: string[];
   offlineModuleNames: string[];
 };
 
@@ -92,6 +93,7 @@ export function simulatePowerTicks(modules: ModuleRecord[], tickCount: number): 
   const batteryModule = nextModules.find(isBatteryModule) as ModuleWithPower | undefined;
   const candidates = createOrderedPowerCandidates(nextModules) as Array<{ module: ModuleWithPower; index: number }>;
   const poweredModuleNames: string[] = [];
+  const poweredModuleIds: string[] = [];
   const offlineModuleNames: string[] = [];
 
   if (!batteryModule) {
@@ -99,6 +101,7 @@ export function simulatePowerTicks(modules: ModuleRecord[], tickCount: number): 
       modules: nextModules,
       batteryEnergyKwh: 0,
       poweredModuleNames,
+      poweredModuleIds,
       offlineModuleNames,
     };
   }
@@ -119,12 +122,14 @@ export function simulatePowerTicks(modules: ModuleRecord[], tickCount: number): 
 
     if (requiredEnergyKwh === 0) {
       poweredModuleNames.push(module.displayName);
+      poweredModuleIds.push(module.id);
       continue;
     }
 
     if (remainingEnergyKwh >= requiredEnergyKwh) {
       remainingEnergyKwh -= requiredEnergyKwh;
       poweredModuleNames.push(module.displayName);
+      poweredModuleIds.push(module.id);
       continue;
     }
 
@@ -139,6 +144,7 @@ export function simulatePowerTicks(modules: ModuleRecord[], tickCount: number): 
     modules: nextModules,
     batteryEnergyKwh: batteryModule.runtimeAttributes.currentEnergyKwh ?? 0,
     poweredModuleNames,
+    poweredModuleIds,
     offlineModuleNames,
   };
 }
