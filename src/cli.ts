@@ -1,5 +1,3 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import { Command } from "commander";
 import {
   advanceConstructionJobs,
@@ -7,13 +5,25 @@ import {
   cancelConstruction,
   spendInventory,
   startConstruction,
+  type InventoryStore,
   type BlueprintRecord,
   type BlueprintOutput,
   type BlueprintRequiredFacility,
   type ConstructionPlan,
   type ConstructionJob,
-  type InventoryStore,
 } from "./construction";
+import {
+  readInventory,
+  readModules,
+  readRegistration,
+  removeInventory,
+  removeModules,
+  removeRegistration,
+  writeInventory,
+  writeModules,
+  writeRegistration,
+  type RegistrationRecord,
+} from "./local-state";
 import { findModuleByReference, getModuleReference } from "./module-refs";
 import {
   getEnergyCostPerTickKwh,
@@ -28,22 +38,6 @@ import {
   type SolarIrradiance,
   type SolarIrradianceResponse,
 } from "./solar";
-
-type ModuleStore = {
-  modules: ModuleRecord[];
-};
-
-type RegistrationRecord = {
-  habitatUuid: string;
-  displayName: string;
-  habitatId: string;
-  baseUrl: string;
-  registeredAt: string;
-  lastSyncedAt: string;
-  starterModules: ModuleRecord[];
-  blueprints: unknown[];
-  lastStatus?: Habitat;
-};
 
 type Habitat = {
   id: string;
@@ -112,18 +106,6 @@ function fail(message: string): never {
   throw new Error(message);
 }
 
-function getRegistrationFile() {
-  return join(process.cwd(), ".habitat", "registration.json");
-}
-
-function getModuleFile() {
-  return join(process.cwd(), ".habitat", "modules.json");
-}
-
-function getInventoryFile() {
-  return join(process.cwd(), ".habitat", "inventory.json");
-}
-
 function getBaseUrl() {
   const value =
     Bun.env.KEPLER_BASE_URL ??
@@ -146,81 +128,6 @@ function requireToken() {
   }
 
   return token;
-}
-
-async function readRegistration() {
-  try {
-    const content = await readFile(getRegistrationFile(), "utf8");
-    return JSON.parse(content) as RegistrationRecord;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-
-    throw error;
-  }
-}
-
-async function writeRegistration(record: RegistrationRecord) {
-  const file = getRegistrationFile();
-  await mkdir(dirname(file), { recursive: true });
-  await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-}
-
-async function removeRegistration() {
-  await rm(getRegistrationFile(), { force: true });
-}
-
-async function readModules() {
-  try {
-    const content = await readFile(getModuleFile(), "utf8");
-    const store = JSON.parse(content) as ModuleStore;
-    return store.modules ?? [];
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return [];
-    }
-
-    throw error;
-  }
-}
-
-async function writeModules(modules: ModuleRecord[]) {
-  const file = getModuleFile();
-  await mkdir(dirname(file), { recursive: true });
-  await writeFile(file, `${JSON.stringify({ modules }, null, 2)}\n`, "utf8");
-}
-
-async function removeModules() {
-  await rm(getModuleFile(), { force: true });
-}
-
-async function readInventory() {
-  try {
-    const content = await readFile(getInventoryFile(), "utf8");
-    const store = JSON.parse(content) as InventoryStore;
-    return {
-      resources: store.resources ?? {},
-    } satisfies InventoryStore;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return {
-        resources: {},
-      } satisfies InventoryStore;
-    }
-
-    throw error;
-  }
-}
-
-async function writeInventory(inventory: InventoryStore) {
-  const file = getInventoryFile();
-  await mkdir(dirname(file), { recursive: true });
-  await writeFile(file, `${JSON.stringify(inventory, null, 2)}\n`, "utf8");
-}
-
-async function removeInventory() {
-  await rm(getInventoryFile(), { force: true });
 }
 
 async function readJsonResponse<T>(response: Response) {
@@ -688,7 +595,7 @@ function printResourceCatalog(resources: ResourceCatalogEntry[]) {
   }
 
   writeStdout("Blueprint requirements may refer to these resource types later.");
-  writeStdout("Local inventory will be tracked separately in habitat files later.");
+  writeStdout("Local inventory is tracked separately from this catalog in your habitat's local state.");
 }
 
 async function requireRegistration() {
@@ -955,7 +862,7 @@ program
   .command("construct")
   .description("Start local construction from a Kepler blueprint.")
   .argument("<blueprint-id>", "blueprint id")
-  .option("--dry-run", "check construction readiness without changing local files")
+  .option("--dry-run", "check construction readiness without changing local state")
   .action(async (blueprintId: string, options: { dryRun?: boolean }) => {
     await requireRegistration();
     const [modules, inventory] = await Promise.all([readModules(), readInventory()]);

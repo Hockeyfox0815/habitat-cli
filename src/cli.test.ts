@@ -1,8 +1,14 @@
-import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { runCli } from "./cli";
+import {
+  getDatabaseFile,
+  readInventory,
+  readModules,
+  writeModules,
+} from "./local-state";
 
 type ModuleRecord = {
   id: string;
@@ -430,14 +436,6 @@ async function runCommand(args: string[]) {
   };
 }
 
-async function readJson<T>(path: string) {
-  return JSON.parse(await readFile(path, "utf8")) as T;
-}
-
-async function writeJson(path: string, value: unknown) {
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
 describe("habitat CLI", () => {
   test("shows only Kepler registration commands plus modules in top-level help", async () => {
     installMockFetch();
@@ -452,7 +450,7 @@ describe("habitat CLI", () => {
   test("hydrates starter modules from the Kepler registration response", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       const register = await runCommand(["register", "--name", "Adrians Land"]);
 
       expect(register.exitCode).toBe(0);
@@ -466,12 +464,11 @@ describe("habitat CLI", () => {
       expect(status.stdout).toContain("Modules");
       expect(status.stdout).toContain("6");
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      expect(await readFile(moduleStorePath, "utf8")).toContain("Command Module");
+      await expect(access(getDatabaseFile())).resolves.toBeNull();
 
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      expect(moduleStore.modules).toHaveLength(6);
-      expect(moduleStore.modules.map((module) => module.displayName)).toEqual([
+      const moduleStore = await readModules();
+      expect(moduleStore).toHaveLength(6);
+      expect(moduleStore.map((module) => module.displayName)).toEqual([
         "Command Module",
         "Life Support",
         "Basic Battery",
@@ -555,7 +552,7 @@ describe("habitat CLI", () => {
       expect(result.stdout).toContain("Basalt Composite");
       expect(result.stdout).toContain("manufactured");
       expect(result.stdout).toContain("Blueprint requirements may refer to these resource types later.");
-      expect(result.stdout).toContain("Local inventory will be tracked separately in habitat files later.");
+      expect(result.stdout).toContain("Local inventory is tracked separately from this catalog in your habitat's local state.");
     });
   });
 
@@ -627,7 +624,7 @@ describe("habitat CLI", () => {
   test("real construction spends inventory, stores an active job, and can be canceled", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
       await runCommand(["module", "set-status", "supply-cache-1", "online"]);
       await runCommand(["inventory", "add", "ferrite", "90"]);
@@ -640,8 +637,7 @@ describe("habitat CLI", () => {
       expect(construct.stdout).toContain("Facility: workshop-fabricator-1");
       expect(construct.stdout).toContain("Output module: small-solar-array-1");
 
-      const inventoryPath = join(cwd, ".habitat", "inventory.json");
-      const inventory = await readJson<{ resources: Record<string, number> }>(inventoryPath);
+      const inventory = await readInventory();
       expect(inventory.resources.ferrite).toBe(0);
       expect(inventory.resources["silicate-glass"]).toBe(0);
       expect(inventory.resources["conductive-ore"]).toBe(0);
@@ -667,9 +663,8 @@ describe("habitat CLI", () => {
       expect(afterCancel.exitCode).toBe(0);
       expect(afterCancel.stdout).toContain("No active construction jobs.");
 
-      const modulesPath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(modulesPath);
-      expect(moduleStore.modules.map((module) => module.blueprintId)).not.toContain("small-solar-array");
+      const moduleStore = await readModules();
+      expect(moduleStore.map((module) => module.blueprintId)).not.toContain("small-solar-array");
     });
   });
 
@@ -740,7 +735,7 @@ describe("habitat CLI", () => {
   test("solar charging increases online battery charge when an online solar module exists", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
       await runCommand([
         "module",
@@ -755,10 +750,9 @@ describe("habitat CLI", () => {
         "solar-generation",
       ]);
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
+      const moduleStore = await readModules();
 
-      for (const module of moduleStore.modules) {
+      for (const module of moduleStore) {
         if (["Command Module", "Life Support", "Workshop Fabricator", "Basic Suitport", "Supply Cache"].includes(module.displayName)) {
           module.runtimeAttributes.status = "offline";
         }
@@ -769,14 +763,14 @@ describe("habitat CLI", () => {
         }
       }
 
-      await writeJson(moduleStorePath, moduleStore);
+      await writeModules(moduleStore);
 
       const tick = await runCommand(["tick", "1"]);
       expect(tick.exitCode).toBe(0);
       expect(tick.stdout).toContain("Solar charging: generated 0.001667 kWh");
 
-      const updatedStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      const battery = updatedStore.modules.find((module) => module.displayName === "Basic Battery");
+      const updatedStore = await readModules();
+      const battery = updatedStore.find((module) => module.displayName === "Basic Battery");
       expect(battery).toBeDefined();
       expect((battery as ModuleRecord).runtimeAttributes.currentEnergyKwh).toBeCloseTo(499.00166666666667, 12);
     });
@@ -816,7 +810,7 @@ describe("habitat CLI", () => {
       },
     });
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
       await runCommand([
         "module",
@@ -831,15 +825,14 @@ describe("habitat CLI", () => {
         "solar-generation",
       ]);
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      for (const module of moduleStore.modules) {
+      const moduleStore = await readModules();
+      for (const module of moduleStore) {
         if (module.displayName === "Basic Battery") {
           module.runtimeAttributes.status = "online";
           module.runtimeAttributes.currentEnergyKwh = 499;
         }
       }
-      await writeJson(moduleStorePath, moduleStore);
+      await writeModules(moduleStore);
 
       const tick = await runCommand(["tick", "1"]);
       expect(tick.exitCode).toBe(0);
@@ -850,7 +843,7 @@ describe("habitat CLI", () => {
   test("solar charging is skipped when the battery is already full", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
       await runCommand(["module", "set-status", "basic-battery-1", "online"]);
       await runCommand([
@@ -866,14 +859,13 @@ describe("habitat CLI", () => {
         "solar-generation",
       ]);
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      for (const module of moduleStore.modules) {
+      const moduleStore = await readModules();
+      for (const module of moduleStore) {
         if (["Command Module", "Life Support", "Workshop Fabricator", "Basic Suitport", "Supply Cache"].includes(module.displayName)) {
           module.runtimeAttributes.status = "offline";
         }
       }
-      await writeJson(moduleStorePath, moduleStore);
+      await writeModules(moduleStore);
 
       const tick = await runCommand(["tick", "1"]);
       expect(tick.exitCode).toBe(0);
@@ -894,10 +886,10 @@ describe("habitat CLI", () => {
     });
   });
 
-  test("supports module CRUD in local JSON storage", async () => {
+  test("supports module CRUD in local SQLite-backed storage", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
 
       const create = await runCommand([
@@ -939,9 +931,8 @@ describe("habitat CLI", () => {
       expect(deleteResult.exitCode).toBe(0);
       expect(deleteResult.stdout).toContain('Deleted module "Telemetry Relay Mk II".');
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      expect(moduleStore.modules.map((module) => module.displayName)).not.toContain("Telemetry Relay Mk II");
+      const moduleStore = await readModules();
+      expect(moduleStore.map((module) => module.displayName)).not.toContain("Telemetry Relay Mk II");
     });
   });
 
@@ -968,12 +959,11 @@ describe("habitat CLI", () => {
   test("set-status updates only a module's runtime state", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const beforeStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      const workshopBefore = beforeStore.modules.find((module) => module.displayName === "Workshop Fabricator");
+      const beforeStore = await readModules();
+      const workshopBefore = beforeStore.find((module) => module.displayName === "Workshop Fabricator");
 
       expect(workshopBefore).toBeDefined();
       if (!workshopBefore) {
@@ -987,8 +977,8 @@ describe("habitat CLI", () => {
       expect(result.stdout).toContain("damaged");
       expect(result.stdout).toContain("1 kW");
 
-      const afterStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      const workshopAfter = afterStore.modules.find((module) => module.id === workshopBefore.id);
+      const afterStore = await readModules();
+      const workshopAfter = afterStore.find((module) => module.id === workshopBefore.id);
 
       expect(workshopAfter).toBeDefined();
       expect(workshopAfter?.runtimeAttributes.status).toBe("damaged");
@@ -1002,7 +992,7 @@ describe("habitat CLI", () => {
   test("ticks drain battery energy using module power draw", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
 
       const tick = await runCommand(["tick", "1"]);
@@ -1010,9 +1000,8 @@ describe("habitat CLI", () => {
       expect(tick.exitCode).toBe(0);
       expect(tick.stdout).toContain("Ran 1 tick.");
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      const battery = moduleStore.modules.find((module) => module.displayName === "Basic Battery");
+      const moduleStore = await readModules();
+      const battery = moduleStore.find((module) => module.displayName === "Basic Battery");
 
       expect(battery).toBeDefined();
       expect((battery as ModuleRecord).runtimeAttributes.currentEnergyKwh).toBeCloseTo(
@@ -1029,12 +1018,11 @@ describe("habitat CLI", () => {
   test("multiple ticks compound and low power keeps critical modules first", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
 
-      const moduleStorePath = join(cwd, ".habitat", "modules.json");
-      const moduleStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      const battery = moduleStore.modules.find((module) => module.displayName === "Basic Battery");
+      const moduleStore = await readModules();
+      const battery = moduleStore.find((module) => module.displayName === "Basic Battery");
 
       expect(battery).toBeDefined();
       if (!battery) {
@@ -1042,18 +1030,18 @@ describe("habitat CLI", () => {
       }
 
       battery.runtimeAttributes.currentEnergyKwh = 0.00205;
-      await writeJson(moduleStorePath, moduleStore);
+      await writeModules(moduleStore);
 
       const tick = await runCommand(["tick", "1"]);
 
       expect(tick.exitCode).toBe(0);
 
-      const updatedStore = await readJson<{ modules: ModuleRecord[] }>(moduleStorePath);
-      const commandModule = updatedStore.modules.find((module) => module.displayName === "Command Module");
-      const lifeSupport = updatedStore.modules.find((module) => module.displayName === "Life Support");
-      const workshop = updatedStore.modules.find((module) => module.displayName === "Workshop Fabricator");
-      const suitport = updatedStore.modules.find((module) => module.displayName === "Basic Suitport");
-      const updatedBattery = updatedStore.modules.find((module) => module.displayName === "Basic Battery");
+      const updatedStore = await readModules();
+      const commandModule = updatedStore.find((module) => module.displayName === "Command Module");
+      const lifeSupport = updatedStore.find((module) => module.displayName === "Life Support");
+      const workshop = updatedStore.find((module) => module.displayName === "Workshop Fabricator");
+      const suitport = updatedStore.find((module) => module.displayName === "Basic Suitport");
+      const updatedBattery = updatedStore.find((module) => module.displayName === "Basic Battery");
 
       expect(commandModule?.runtimeAttributes.status).toBe("active");
       expect(lifeSupport?.runtimeAttributes.status).toBe("active");
@@ -1063,18 +1051,48 @@ describe("habitat CLI", () => {
     });
   });
 
+  test("status depends on the SQLite database instead of old JSON state", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+      const databasePath = getDatabaseFile();
+      const renamedPath = `${databasePath}-old`;
+
+      await rename(databasePath, renamedPath);
+
+      const missingState = await runCommand(["status"]);
+      expect(missingState.exitCode).toBe(0);
+      expect(missingState.stdout).toContain("Not registered with Kepler.");
+
+      await rename(renamedPath, databasePath);
+
+      const restored = await runCommand(["status"]);
+      expect(restored.exitCode).toBe(0);
+      expect(restored.stdout).toContain("Display Name");
+    });
+  });
+
   test("unregister removes local module storage", async () => {
     installMockFetch();
 
-    await withWorkspace(async (cwd) => {
+    await withWorkspace(async () => {
       await runCommand(["register", "--name", "Adrians Land"]);
+
       const unregister = await runCommand(["unregister"]);
 
       expect(unregister.exitCode).toBe(0);
       expect(unregister.stdout).toContain('Unregistered "Adrians Land" from Kepler.');
-      await expect(readFile(join(cwd, ".habitat", "registration.json"), "utf8")).rejects.toThrow();
-      await expect(readFile(join(cwd, ".habitat", "modules.json"), "utf8")).rejects.toThrow();
-      await expect(readFile(join(cwd, ".habitat", "inventory.json"), "utf8")).rejects.toThrow();
+
+      const status = await runCommand(["status"]);
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("Not registered with Kepler.");
+
+      const modules = await readModules();
+      const inventory = await readInventory();
+
+      expect(modules).toHaveLength(0);
+      expect(inventory.resources).toEqual({});
     });
   });
 
