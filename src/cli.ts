@@ -13,17 +13,28 @@ import {
   type ConstructionJob,
 } from "./construction";
 import {
+  readBlueprint,
+  readBlueprintCatalog,
+  readHabitatStatus,
+  getApiBaseUrl,
   readInventory,
   readModules,
   readRegistration,
+  readResourceCatalog,
+  readSolarIrradiance as readSolarIrradianceFromApi,
+  registerHabitat,
   removeInventory,
   removeModules,
   removeRegistration,
+  ApiClientError,
+  unregisterHabitat,
   writeInventory,
   writeModules,
   writeRegistration,
+  type Habitat,
   type RegistrationRecord,
-} from "./local-state";
+  type ResourceCatalogEntry,
+} from "./api-client";
 import { findModuleByReference, getModuleReference } from "./module-refs";
 import {
   getEnergyCostPerTickKwh,
@@ -36,49 +47,7 @@ import {
   applySolarCharging,
   formatSolarStatus,
   type SolarIrradiance,
-  type SolarIrradianceResponse,
 } from "./solar";
-
-type Habitat = {
-  id: string;
-  habitatSlug: string;
-  displayName: string;
-  catalogVersion: string;
-  status: string;
-  lastSeenAt?: string | null;
-};
-
-type HabitatRegistrationResponse = {
-  habitatId: string;
-  starterModules: ModuleRecord[];
-  blueprints: unknown[];
-};
-
-type HabitatResponse = {
-  habitat: Habitat;
-};
-
-type BlueprintCatalogResponse = {
-  blueprints: BlueprintRecord[];
-};
-
-type BlueprintResponse = {
-  blueprint: BlueprintRecord;
-};
-
-type ResourceCatalogEntry = {
-  resourceType: string;
-  displayName?: string;
-  description?: string;
-  category?: string;
-};
-
-type ResourceCatalogResponse = {
-  resources: ResourceCatalogEntry[];
-};
-
-const DEFAULT_BASE_URL = "https://planet.turingguild.com";
-
 const program = new Command();
 program.exitOverride();
 
@@ -106,92 +75,15 @@ function fail(message: string): never {
   throw new Error(message);
 }
 
-function getBaseUrl() {
-  const value =
-    Bun.env.KEPLER_BASE_URL ??
-    Bun.env.KEPLER_WORLD_BASE_URL ??
-    Bun.env.PLANET_SERVER_PUBLIC_BASE_URL ??
-    DEFAULT_BASE_URL;
-
-  return value.replace(/\/+$/, "");
-}
-
-function getToken() {
-  return Bun.env.KEPLER_PLANET_TOKEN ?? Bun.env.KEPLER_WORLD_TOKEN ?? Bun.env.PLANET_TOKEN;
-}
-
-function requireToken() {
-  const token = getToken();
-
-  if (!token) {
-    fail("Missing Kepler token. Set KEPLER_PLANET_TOKEN in your environment or .env file.");
-  }
-
-  return token;
-}
-
-async function readJsonResponse<T>(response: Response) {
-  const text = await response.text();
-
-  if (!response.ok) {
-    const details = text ? ` ${text}` : "";
-    fail(`Kepler request failed with ${response.status}.${details}`);
-  }
-
-  return text ? (JSON.parse(text) as T) : ({} as T);
-}
-
-async function keplerRequest<T>(path: string, options: RequestInit = {}, baseUrl = getBaseUrl()) {
-  let response: Response;
-
-  try {
-    response = await fetch(`${baseUrl}${path}`, {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${requireToken()}`,
-        Accept: "application/json",
-        ...options.headers,
-      },
-    });
-  } catch (error) {
-    const details = error instanceof Error ? ` ${error.message}` : "";
-    fail(`Unable to reach Kepler at ${baseUrl}.${details}`);
-  }
-
-  return readJsonResponse<T>(response);
-}
-
-async function keplerCatalogRequest<T>(path: string, notFoundMessage: string, baseUrl = getBaseUrl()) {
-  let response: Response;
-
-  try {
-    response = await fetch(`${baseUrl}${path}`, {
-      headers: {
-        Authorization: `Bearer ${requireToken()}`,
-        Accept: "application/json",
-      },
-    });
-  } catch (error) {
-    const details = error instanceof Error ? ` ${error.message}` : "";
-    fail(`Unable to reach Kepler at ${baseUrl}.${details}`);
-  }
-
-  if (response.status === 404) {
-    fail(notFoundMessage);
-  }
-
-  return readJsonResponse<T>(response);
-}
-
-async function readSolarIrradiance() {
-  const response = await keplerRequest<SolarIrradianceResponse>("/world/solar-irradiance");
+async function readCurrentSolarIrradiance() {
+  const response = await readSolarIrradianceFromApi();
   return response.solarIrradiance;
 }
 
 async function tryReadSolarIrradiance() {
   try {
     return {
-      irradiance: await readSolarIrradiance(),
+      irradiance: await readCurrentSolarIrradiance(),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -239,6 +131,9 @@ function printRegistration(record: RegistrationRecord) {
   writeStdout(`Habitat ID: ${record.habitatId}`);
   writeStdout(`Habitat UUID: ${record.habitatUuid}`);
   writeStdout(`Display Name: ${record.displayName}`);
+  if (record.apiToken) {
+    writeStdout(`API Token: ${record.apiToken}`);
+  }
   writeStdout(`Base URL: ${record.baseUrl}`);
   writeStdout(`Registered At: ${record.registeredAt}`);
   writeStdout(`Starter Modules: ${record.starterModules.length}`);
@@ -631,16 +526,10 @@ program
 
     const habitatUuid = crypto.randomUUID();
     const displayName = options.name;
-    const baseUrl = getBaseUrl();
-    const response = await keplerRequest<HabitatRegistrationResponse>("/habitats/register", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        habitatUuid,
-        displayName,
-      }),
+    const baseUrl = getApiBaseUrl();
+    const response = await registerHabitat({
+      habitatUuid,
+      displayName,
     });
 
     const now = new Date().toISOString();
@@ -648,6 +537,7 @@ program
       habitatUuid,
       displayName,
       habitatId: response.habitatId,
+      apiToken: response.apiToken,
       baseUrl,
       registeredAt: now,
       lastSyncedAt: now,
@@ -679,7 +569,7 @@ program
       return;
     }
 
-    const response = await keplerRequest<HabitatResponse>(`/habitats/${record.habitatId}`, {}, record.baseUrl);
+    const response = await readHabitatStatus(record.habitatId);
     const modules = await readModules();
     const nextRecord: RegistrationRecord = {
       ...record,
@@ -703,7 +593,7 @@ program
       return;
     }
 
-    await keplerRequest(`/habitats/${record.habitatId}`, { method: "DELETE" }, record.baseUrl);
+    await unregisterHabitat(record.habitatId);
     await removeRegistration();
     await removeModules();
     await removeInventory();
@@ -766,10 +656,7 @@ blueprintCommand
   .command("list")
   .description("List official Kepler blueprints.")
   .action(async () => {
-    const response = await keplerCatalogRequest<BlueprintCatalogResponse>(
-      "/catalog/blueprints",
-      "Kepler blueprint catalog was not found.",
-    );
+    const response = await readBlueprintCatalog();
     const blueprints = response.blueprints ?? [];
 
     if (blueprints.length === 0) {
@@ -785,12 +672,16 @@ blueprintCommand
   .description("Show one official Kepler blueprint.")
   .argument("<blueprint-id>", "blueprint id")
   .action(async (blueprintId: string) => {
-    const response = await keplerCatalogRequest<BlueprintResponse>(
-      `/catalog/blueprints/${encodeURIComponent(blueprintId)}`,
-      `Blueprint "${blueprintId}" was not found in the Kepler catalog.`,
-    );
+    try {
+      const response = await readBlueprint(blueprintId);
+      printBlueprintDetails(response.blueprint);
+    } catch (error) {
+      if (error instanceof ApiClientError && error.status === 404) {
+        fail(`Blueprint "${blueprintId}" was not found in the Kepler catalog.`);
+      }
 
-    printBlueprintDetails(response.blueprint);
+      throw error;
+    }
   });
 
 const resourceCommand = program.command("resource").description("Read official Kepler resource catalog data.");
@@ -799,10 +690,7 @@ resourceCommand
   .command("list")
   .description("List official Kepler resource types.")
   .action(async () => {
-    const response = await keplerCatalogRequest<ResourceCatalogResponse>(
-      "/catalog/resources",
-      "Kepler resource catalog was not found.",
-    );
+    const response = await readResourceCatalog();
     const resources = response.resources ?? [];
 
     if (resources.length === 0) {
@@ -819,7 +707,7 @@ solarCommand
   .command("status")
   .description("Show current solar irradiance from Kepler.")
   .action(async () => {
-    const irradiance = await readSolarIrradiance();
+    const irradiance = await readCurrentSolarIrradiance();
 
     if (!irradiance || typeof irradiance.wPerM2 !== "number") {
       fail("Kepler did not return a usable solar irradiance reading.");
@@ -866,10 +754,7 @@ program
   .action(async (blueprintId: string, options: { dryRun?: boolean }) => {
     await requireRegistration();
     const [modules, inventory] = await Promise.all([readModules(), readInventory()]);
-    const response = await keplerCatalogRequest<BlueprintResponse>(
-      `/catalog/blueprints/${encodeURIComponent(blueprintId)}`,
-      `Blueprint "${blueprintId}" was not found in the Kepler catalog.`,
-    );
+    const response = await readBlueprint(blueprintId);
     const plan = buildConstructionPlan(response.blueprint, modules, inventory);
 
     printConstructionPlan(plan, Boolean(options.dryRun));

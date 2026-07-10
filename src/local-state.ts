@@ -7,6 +7,7 @@ export type RegistrationRecord = {
   habitatUuid: string;
   displayName: string;
   habitatId: string;
+  apiToken?: string;
   baseUrl: string;
   registeredAt: string;
   lastSyncedAt: string;

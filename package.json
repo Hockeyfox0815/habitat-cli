@@ -7,10 +7,12 @@
     "habitat": "./bin/habitat"
   },
   "scripts": {
-    "start": "bun run ./bin/habitat"
+    "start": "bun run ./bin/habitat",
+    "server": "bun run ./src/server.ts"
   },
   "dependencies": {
-    "commander": "^14.0.0"
+    "commander": "^14.0.0",
+    "hono": "^4.12.29"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

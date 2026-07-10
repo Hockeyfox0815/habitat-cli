@@ -2,13 +2,10 @@ import { access, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { readInventory, readModules, writeModules } from "./api-client";
 import { runCli } from "./cli";
-import {
-  getDatabaseFile,
-  readInventory,
-  readModules,
-  writeModules,
-} from "./local-state";
+import { createHabitatApp } from "./routes";
+import { getDatabaseFile } from "./local-state";
 
 type ModuleRecord = {
   id: string;
@@ -342,9 +339,15 @@ function installMockFetch(options?: {
   };
   failSolarStatus?: boolean;
 }) {
+  const app = createHabitatApp();
+
   globalThis.fetch = (async (input: Request | URL | string, init?: RequestInit) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
+
+    if ((url.hostname === "localhost" || url.hostname === "127.0.0.1") && url.port === "8787") {
+      return app.fetch(request);
+    }
 
     if (request.method === "POST" && url.pathname === "/habitats/register") {
       return Response.json(
@@ -437,6 +440,19 @@ async function runCommand(args: string[]) {
 }
 
 describe("habitat CLI", () => {
+  test("serves registration JSON directly from the Hono app", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      const app = createHabitatApp();
+      const response = await app.fetch(new Request("http://localhost:8787/registration"));
+      const body = (await response.json()) as { registration: null };
+
+      expect(response.status).toBe(200);
+      expect(body).toEqual({ registration: null });
+    });
+  });
+
   test("shows only Kepler registration commands plus modules in top-level help", async () => {
     installMockFetch();
 
@@ -493,6 +509,13 @@ describe("habitat CLI", () => {
     installMockFetch();
 
     await withWorkspace(async () => {
+      const logs: string[] = [];
+      const originalConsoleLog = console.log;
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+      };
+
+      try {
       const result = await runCommand(["blueprint", "list"]);
 
       expect(result.exitCode).toBe(0);
@@ -508,6 +531,13 @@ describe("habitat CLI", () => {
       expect(result.stdout).toContain("workshop-fabricator lvl 1");
       expect(result.stdout).toContain("180");
       expect(result.stdout).toContain("published");
+      expect(logs.some((line) => line.includes("[habitat-api] GET /catalog/blueprints -> proxied to Kepler"))).toBe(true);
+      expect(logs.some((line) => line.includes("[kepler] GET /catalog/blueprints -> 200"))).toBe(true);
+      expect(logs.some((line) => line.includes("Bearer"))).toBe(false);
+      expect(logs.some((line) => line.includes(token))).toBe(false);
+      } finally {
+        console.log = originalConsoleLog;
+      }
     });
   });
 
