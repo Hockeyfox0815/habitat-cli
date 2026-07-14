@@ -3,6 +3,7 @@ import type { RegistrationRecord } from "./local-state";
 import type { ModuleRecord } from "./power";
 import type { BlueprintRecord } from "./construction";
 import type { SolarIrradianceResponse } from "./solar";
+import type { WorldScanResponse } from "./scan";
 
 export type { RegistrationRecord } from "./local-state";
 
@@ -43,6 +44,13 @@ export type ResourceCatalogEntry = {
 
 export type ResourceCatalogResponse = {
   resources: ResourceCatalogEntry[];
+};
+
+export type WorldScanRequest = {
+  x: number;
+  y: number;
+  sensorStrength: number;
+  radiusTiles: number;
 };
 
 export class ApiClientError extends Error {
@@ -167,4 +175,15 @@ export async function readResourceCatalog() {
 
 export async function readSolarIrradiance() {
   return requestApi<SolarIrradianceResponse>("/world/solar-irradiance");
+}
+
+export async function readWorldScan(request: WorldScanRequest) {
+  const params = new URLSearchParams({
+    x: `${request.x}`,
+    y: `${request.y}`,
+    sensorStrength: `${request.sensorStrength}`,
+    radiusTiles: `${request.radiusTiles}`,
+  });
+
+  return requestApi<WorldScanResponse>(`/world/scan?${params.toString()}`);
 }

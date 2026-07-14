@@ -14,6 +14,7 @@ import {
   type RegistrationRecord,
 } from "./local-state";
 import type { ModuleRecord } from "./power";
+import type { WorldScanResponse } from "./scan";
 
 const DEFAULT_KEPLER_BASE_URL = "https://planet.turingguild.com";
 
@@ -128,6 +129,37 @@ async function proxyKepler<T>(c: Context, path: string, options: RequestInit = {
 
 function toRegistrationResponse(registration: RegistrationRecord | null) {
   return { registration };
+}
+
+function parseInteger(value: string | null | undefined, label: string) {
+  if (value === null || value === undefined) {
+    throw new Error(`${label} is required.`);
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || `${parsed}` !== value.trim()) {
+    throw new Error(`${label} must be an integer.`);
+  }
+
+  return parsed;
+}
+
+function parseBoundedInteger(value: string | null | undefined, label: string, min: number, max: number) {
+  const parsed = parseInteger(value, label);
+  if (parsed < min || parsed > max) {
+    throw new Error(`${label} must be between ${min} and ${max}.`);
+  }
+
+  return parsed;
+}
+
+async function readRegisteredHabitatId() {
+  const registration = await readRegistration();
+  if (!registration) {
+    throw new Error('Not registered with Kepler. Run habitat register --name "<habitat name>" to register.');
+  }
+
+  return registration.habitatId;
 }
 
 export function createHabitatApp() {
@@ -258,6 +290,30 @@ export function createHabitatApp() {
   app.get("/world/solar-irradiance", async (c) => {
     logHabitatApi("GET", "/world/solar-irradiance", "proxied to Kepler");
     return proxyKepler<{ solarIrradiance: unknown }>(c, "/world/solar-irradiance");
+  });
+
+  app.get("/world/scan", async (c) => {
+    try {
+      const habitatId = await readRegisteredHabitatId();
+      const x = parseInteger(c.req.query("x"), "x");
+      const y = parseInteger(c.req.query("y"), "y");
+      const sensorStrength = parseBoundedInteger(c.req.query("sensorStrength"), "sensorStrength", 0, 100);
+      const radiusTiles = parseBoundedInteger(c.req.query("radiusTiles"), "radiusTiles", 0, 5);
+
+      const params = new URLSearchParams({
+        habitatId,
+        x: `${x}`,
+        y: `${y}`,
+        sensorStrength: `${sensorStrength}`,
+        radiusTiles: `${radiusTiles}`,
+      });
+
+      logHabitatApi("GET", "/world/scan", "proxied to Kepler");
+      return proxyKepler<WorldScanResponse>(c, `/world/scan?${params.toString()}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.json({ error: message }, 400);
+    }
   });
 
   return app;

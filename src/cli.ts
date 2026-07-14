@@ -21,6 +21,7 @@ import {
   readModules,
   readRegistration,
   readResourceCatalog,
+  readWorldScan,
   readSolarIrradiance as readSolarIrradianceFromApi,
   registerHabitat,
   removeInventory,
@@ -48,13 +49,14 @@ import {
   formatSolarStatus,
   type SolarIrradiance,
 } from "./solar";
-const program = new Command();
-program.exitOverride();
-
-type OutputWriters = {
+import { printWorldScan, printWorldScanJson } from "./scan";
+export type OutputWriters = {
   stdout: (message: string) => void;
   stderr: (message: string) => void;
 };
+
+const program = new Command();
+program.exitOverride();
 
 const defaultOutputWriters: OutputWriters = {
   stdout: (message) => console.log(message),
@@ -125,6 +127,28 @@ function parseRuntimeAttributes(value?: string) {
 
     throw error;
   }
+}
+
+function parseIntegerOption(value: string | undefined, label: string) {
+  if (value === undefined) {
+    fail(`${label} is required.`);
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || `${parsed}` !== value.trim()) {
+    fail(`${label} must be an integer.`);
+  }
+
+  return parsed;
+}
+
+function parseBoundedIntegerOption(value: string | undefined, label: string, min: number, max: number) {
+  const parsed = parseIntegerOption(value, label);
+  if (parsed < min || parsed > max) {
+    fail(`${label} must be between ${min} and ${max}.`);
+  }
+
+  return parsed;
 }
 
 function printRegistration(record: RegistrationRecord) {
@@ -699,6 +723,37 @@ resourceCommand
     }
 
     printResourceCatalog(resources);
+  });
+
+program
+  .command("scan")
+  .description("Scan nearby Kepler resources from the habitat position and sensor strength.")
+  .requiredOption("--x <integer>", "current x coordinate")
+  .requiredOption("--y <integer>", "current y coordinate")
+  .requiredOption("--strength <0-100>", "effective sensor strength")
+  .option("--radius <0-5>", "scan radius", "0")
+  .option("--json", "print the complete JSON response")
+  .action(async (options: { x: string; y: string; strength: string; radius?: string; json?: boolean }) => {
+    await requireRegistration();
+
+    const x = parseIntegerOption(options.x, "--x");
+    const y = parseIntegerOption(options.y, "--y");
+    const sensorStrength = parseBoundedIntegerOption(options.strength, "--strength", 0, 100);
+    const radiusTiles = parseBoundedIntegerOption(options.radius ?? "0", "--radius", 0, 5);
+
+    const response = await readWorldScan({
+      x,
+      y,
+      sensorStrength,
+      radiusTiles,
+    });
+
+    if (options.json) {
+      printWorldScanJson(response, outputWriters);
+      return;
+    }
+
+    printWorldScan(response, outputWriters);
   });
 
 const solarCommand = program.command("solar").description("Read current Kepler solar conditions.");

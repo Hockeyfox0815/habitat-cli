@@ -308,15 +308,167 @@ const defaultSolarStatus = {
   },
 };
 
+type ScanProbability = {
+  resourceType: string;
+  probability: number;
+};
+
+type ScanQuantityEstimate = {
+  candidateResource: string;
+  kilograms: number;
+  estimatedValue: number;
+  minimumKilograms: number;
+  maximumKilograms: number;
+  exact: boolean;
+};
+
+type ScanTile = {
+  x: number;
+  y: number;
+  distance: number;
+  terrain: string;
+  resourceProbabilities: ScanProbability[];
+  topCandidate: ScanProbability | null;
+  quantityEstimate: ScanQuantityEstimate | null;
+};
+
+type ScanResponse = {
+  modelVersion: string;
+  origin: {
+    x: number;
+    y: number;
+  };
+  sensorStrength: number;
+  radiusTiles: number;
+  tiles: ScanTile[];
+};
+
+const scanResourceTypes = catalogResources.map((resource) => resource.resourceType);
+
+let observedScanRequests: Array<{
+  habitatId: string | null;
+  x: string | null;
+  y: string | null;
+  sensorStrength: string | null;
+  radiusTiles: string | null;
+}> = [];
+
+function buildScanProbabilities(topResource: string, confidence: number) {
+  const resourceTypes = [...scanResourceTypes, "none"];
+  const topProbability = Math.max(0, Math.min(100, Math.round(confidence)));
+  const otherResources = resourceTypes.filter((resourceType) => resourceType !== topResource);
+  const remaining = 100 - topProbability;
+  const weights = otherResources.map((_, index) => index + 1);
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  let distributed = 0;
+
+  const probabilities = otherResources.map((resourceType, index) => {
+    const share = Math.floor((remaining * weights[index]) / totalWeight);
+    distributed += share;
+    return {
+      resourceType,
+      probability: share,
+    };
+  });
+
+  const remainder = remaining - distributed;
+  for (let index = 0; index < remainder; index += 1) {
+    probabilities[index % probabilities.length].probability += 1;
+  }
+
+  probabilities.push({
+    resourceType: topResource,
+    probability: topProbability,
+  });
+
+  return probabilities.sort(
+    (left, right) => resourceTypes.indexOf(left.resourceType) - resourceTypes.indexOf(right.resourceType),
+  );
+}
+
+function buildScanQuantityEstimate(topResource: string, exact: boolean, distance: number): ScanQuantityEstimate | null {
+  if (topResource === "none") {
+    return null;
+  }
+
+  if (exact) {
+    return {
+      candidateResource: topResource,
+      kilograms: 18,
+      estimatedValue: 180,
+      minimumKilograms: 18,
+      maximumKilograms: 18,
+      exact: true,
+    };
+  }
+
+  const spread = Math.max(2, Math.round(distance * 2) + 4);
+  const kilograms = 12 + Math.max(0, 4 - Math.round(distance));
+
+  return {
+    candidateResource: topResource,
+    kilograms,
+    estimatedValue: 120 - Math.round(distance * 5),
+    minimumKilograms: kilograms - spread,
+    maximumKilograms: kilograms + spread,
+    exact: false,
+  };
+}
+
+function buildScanResponse(params: URLSearchParams): ScanResponse {
+  const x = Number.parseInt(params.get("x") ?? "0", 10);
+  const y = Number.parseInt(params.get("y") ?? "0", 10);
+  const sensorStrength = Number.parseInt(params.get("sensorStrength") ?? "0", 10);
+  const radiusTiles = Number.parseInt(params.get("radiusTiles") ?? "0", 10);
+  const tiles: ScanTile[] = [];
+  const minX = x - radiusTiles;
+  const maxX = x + radiusTiles;
+  const minY = y - radiusTiles;
+  const maxY = y + radiusTiles;
+
+  for (let tileX = minX; tileX <= maxX; tileX += 1) {
+    for (let tileY = minY; tileY <= maxY; tileY += 1) {
+      const distance = Number(Math.hypot(tileX - x, tileY - y).toFixed(2));
+      const exact = sensorStrength === 100 && distance === 0;
+      const topResource = exact ? "ferrite" : distance === 0 ? "ferrite" : (Math.abs(tileX + tileY) % 2 === 0 ? "basalt-composite" : "silicate-glass");
+      const confidence = exact ? 100 : Math.max(5, Math.min(95, Math.round(sensorStrength - distance * 20)));
+
+      tiles.push({
+        x: tileX,
+        y: tileY,
+        distance,
+        terrain: "flat",
+        resourceProbabilities: buildScanProbabilities(topResource, confidence),
+        topCandidate: {
+          resourceType: topResource,
+          probability: confidence,
+        },
+        quantityEstimate: buildScanQuantityEstimate(topResource, exact, distance),
+      });
+    }
+  }
+
+  return {
+    modelVersion: "kepler-scan-v1",
+    origin: { x, y },
+    sensorStrength,
+    radiusTiles,
+    tiles,
+  };
+}
+
 let originalFetch: typeof fetch;
 let originalCwd: string;
 let originalToken: string | undefined;
+let originalApiBaseUrl: string | undefined;
 
 beforeAll(() => {
   originalFetch = globalThis.fetch;
   originalCwd = process.cwd();
   originalToken = process.env.KEPLER_PLANET_TOKEN;
+  originalApiBaseUrl = process.env.HABITAT_API_BASE_URL;
   process.env.KEPLER_PLANET_TOKEN = token;
+  process.env.HABITAT_API_BASE_URL = "http://localhost:8787";
 });
 
 afterAll(() => {
@@ -327,6 +479,12 @@ afterAll(() => {
     delete process.env.KEPLER_PLANET_TOKEN;
   } else {
     process.env.KEPLER_PLANET_TOKEN = originalToken;
+  }
+
+  if (originalApiBaseUrl === undefined) {
+    delete process.env.HABITAT_API_BASE_URL;
+  } else {
+    process.env.HABITAT_API_BASE_URL = originalApiBaseUrl;
   }
 });
 
@@ -340,6 +498,7 @@ function installMockFetch(options?: {
   failSolarStatus?: boolean;
 }) {
   const app = createHabitatApp();
+  observedScanRequests = [];
 
   globalThis.fetch = (async (input: Request | URL | string, init?: RequestInit) => {
     const request = input instanceof Request ? input : new Request(input, init);
@@ -387,6 +546,18 @@ function installMockFetch(options?: {
       }
 
       return Response.json(options?.solarStatus ?? defaultSolarStatus);
+    }
+
+    if (request.method === "GET" && url.pathname === "/world/scan") {
+      observedScanRequests.push({
+        habitatId: url.searchParams.get("habitatId"),
+        x: url.searchParams.get("x"),
+        y: url.searchParams.get("y"),
+        sensorStrength: url.searchParams.get("sensorStrength"),
+        radiusTiles: url.searchParams.get("radiusTiles"),
+      });
+
+      return Response.json(buildScanResponse(url.searchParams));
     }
 
     if (request.method === "GET" && url.pathname === "/catalog/blueprints/basic-battery") {
@@ -583,6 +754,101 @@ describe("habitat CLI", () => {
       expect(result.stdout).toContain("manufactured");
       expect(result.stdout).toContain("Blueprint requirements may refer to these resource types later.");
       expect(result.stdout).toContain("Local inventory is tracked separately from this catalog in your habitat's local state.");
+    });
+  });
+
+  test("scans a single tile and shows the full probability table", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const result = await runCommand(["scan", "--x", "3", "--y", "-2", "--strength", "60"]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Scan origin: (3, -2)");
+      expect(result.stdout).toContain("Sensor strength: 60");
+      expect(result.stdout).toContain("Radius: 0");
+      expect(result.stdout).toContain("Tile: (3, -2)");
+      expect(result.stdout).toContain("Terrain: flat");
+      expect(result.stdout).toContain("Probability distribution:");
+      expect(result.stdout).toContain("Resource");
+      expect(result.stdout).toContain("Probability");
+      expect(result.stdout).toContain("ferrite");
+      expect(result.stdout).toContain("none");
+      expect(result.stdout).toContain("Estimated quantity:");
+      expect(result.stdout).toContain("range");
+      expect(observedScanRequests).toHaveLength(1);
+      expect(observedScanRequests[0]).toEqual({
+        habitatId,
+        x: "3",
+        y: "-2",
+        sensorStrength: "60",
+        radiusTiles: "0",
+      });
+    });
+  });
+
+  test("strength 100 at distance 0 identifies the resource exactly", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const result = await runCommand(["scan", "--x", "3", "--y", "-2", "--strength", "100"]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Top candidate: ferrite (100%)");
+      expect(result.stdout).toContain("Estimated quantity: ferrite 18 kg, value 180, exact");
+      expect(result.stdout).toContain("100%");
+      expect(result.stdout).toContain("0%");
+    });
+  });
+
+  test("radius scans summarize nearby tiles and can print JSON", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const result = await runCommand(["scan", "--x", "3", "--y", "-2", "--strength", "60", "--radius", "1"]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Tiles returned: 9");
+      expect(result.stdout).toContain("Top Candidate");
+      expect(result.stdout).toContain("Confidence");
+      expect(result.stdout).toContain("Quantity");
+      expect(result.stdout).toContain("flat");
+      expect(result.stdout).toContain("ferrite");
+
+      const json = await runCommand(["scan", "--x", "3", "--y", "-2", "--strength", "60", "--radius", "1", "--json"]);
+      expect(json.exitCode).toBe(0);
+
+      const parsed = JSON.parse(json.stdout) as ScanResponse;
+      expect(parsed.modelVersion).toBe("kepler-scan-v1");
+      expect(parsed.origin).toEqual({ x: 3, y: -2 });
+      expect(parsed.sensorStrength).toBe(60);
+      expect(parsed.radiusTiles).toBe(1);
+      expect(parsed.tiles).toHaveLength(9);
+      expect(parsed.tiles[4].quantityEstimate).toBeTruthy();
+    });
+  });
+
+  test("scan input validation stops invalid requests before they reach the API", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      await runCommand(["register", "--name", "Adrians Land"]);
+
+      const badStrength = await runCommand(["scan", "--x", "3", "--y", "-2", "--strength", "101"]);
+      expect(badStrength.exitCode).toBe(1);
+      expect(badStrength.stderr).toContain("--strength must be between 0 and 100.");
+
+      const badRadius = await runCommand(["scan", "--x", "3", "--y", "-2", "--strength", "60", "--radius", "6"]);
+      expect(badRadius.exitCode).toBe(1);
+      expect(badRadius.stderr).toContain("--radius must be between 0 and 5.");
+
+      expect(observedScanRequests).toHaveLength(0);
     });
   });
 
