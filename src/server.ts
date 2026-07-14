@@ -1,6 +1,6 @@
 import { createHabitatApp } from "./routes";
 
-const host = Bun.env.HABITAT_API_HOST ?? "127.0.0.1";
+const host = Bun.env.HABITAT_API_HOST ?? "0.0.0.0";
 const port = Number(Bun.env.HABITAT_API_PORT ?? "8787");
 const app = createHabitatApp();
 
