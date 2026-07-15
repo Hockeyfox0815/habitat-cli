@@ -1,11 +1,18 @@
 import type { InventoryStore } from "./construction";
-import type { RegistrationRecord } from "./local-state";
+import type {
+  HabitatContractsRecord,
+  HabitatStateBootstrap,
+  RegistrationRecord,
+  StarterHumanRecord,
+} from "./local-state";
 import type { ModuleRecord } from "./power";
 import type { BlueprintRecord } from "./construction";
 import type { SolarIrradianceResponse } from "./solar";
 import type { WorldScanResponse } from "./scan";
 
 export type { RegistrationRecord } from "./local-state";
+export type { StarterHumanRecord, HabitatContractsRecord } from "./local-state";
+export type { HabitatStateBootstrap } from "./local-state";
 
 export type Habitat = {
   id: string;
@@ -19,6 +26,8 @@ export type Habitat = {
 export type HabitatRegistrationResponse = {
   habitatId: string;
   starterModules: ModuleRecord[];
+  starterHumans: StarterHumanRecord[];
+  contracts: HabitatContractsRecord;
   blueprints: unknown[];
   apiToken?: string;
 };
@@ -110,6 +119,31 @@ export async function writeRegistration(record: RegistrationRecord) {
   });
 }
 
+export async function bootstrapRegistration(payload: HabitatStateBootstrap) {
+  try {
+    await requestApi("/registration/bootstrap", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    return;
+  } catch (error) {
+    if (!(error instanceof ApiClientError) || error.status !== 404) {
+      throw error;
+    }
+  }
+
+  // Older Habitat API deployments do not have the atomic bootstrap route yet.
+  await writeRegistration(payload.registration);
+  await writeModules(payload.modules);
+  try {
+    await writeHumans(payload.humans);
+  } catch (error) {
+    if (!(error instanceof ApiClientError) || error.status !== 404) {
+      throw error;
+    }
+  }
+}
+
 export async function removeRegistration() {
   await requestApi("/registration", { method: "DELETE" });
 }
@@ -128,6 +162,28 @@ export async function writeModules(modules: ModuleRecord[]) {
 
 export async function removeModules() {
   await requestApi("/modules", { method: "DELETE" });
+}
+
+export async function readHumans() {
+  const response = await requestApi<{ humans: StarterHumanRecord[] }>("/humans");
+  return response.humans ?? [];
+}
+
+export async function writeHumans(humans: StarterHumanRecord[]) {
+  await requestApi("/humans", {
+    method: "PUT",
+    body: JSON.stringify({ humans }),
+  });
+}
+
+export async function removeHumans() {
+  try {
+    await requestApi("/humans", { method: "DELETE" });
+  } catch (error) {
+    if (!(error instanceof ApiClientError) || error.status !== 404) {
+      throw error;
+    }
+  }
 }
 
 export async function readInventory() {

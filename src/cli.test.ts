@@ -2,7 +2,7 @@ import { access, mkdtemp, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { readInventory, readModules, writeModules } from "./api-client";
+import { readHumans, readInventory, readModules, readRegistration, writeModules } from "./api-client";
 import { runCli } from "./cli";
 import { createHabitatApp } from "./routes";
 import { getDatabaseFile } from "./local-state";
@@ -161,6 +161,29 @@ const blueprints = [
     displayName: "Command Module Blueprint",
   },
 ];
+
+const starterHumans = [
+  {
+    id: "human-1",
+    displayName: "George",
+    locationModuleId: "habitat_test_123_command_module_1",
+  },
+  {
+    id: "human-2",
+    displayName: "Henry",
+    locationModuleId: "habitat_test_123_command_module_1",
+  },
+];
+
+const contracts = {
+  alerts: {
+    schemaVersion: "1.0",
+    schema: {
+      title: "Habitat Alert",
+      type: "object",
+    },
+  },
+};
 
 const catalogBlueprints = [
   {
@@ -513,6 +536,8 @@ function installMockFetch(options?: {
         {
           habitatId,
           starterModules,
+          starterHumans,
+          contracts,
           blueprints,
         },
         { status: 201 },
@@ -664,6 +689,23 @@ describe("habitat CLI", () => {
         "Basic Suitport",
       ]);
 
+      const registration = await readRegistration();
+      expect(registration).toBeTruthy();
+      expect(registration?.starterHumans).toHaveLength(2);
+      expect(registration?.starterHumans?.map((human) => human.locationModuleId)).toEqual([
+        "habitat_test_123_command_module_1",
+        "habitat_test_123_command_module_1",
+      ]);
+      expect(registration?.contracts?.alerts.schemaVersion).toBe("1.0");
+
+      const humans = await readHumans();
+      expect(humans).toHaveLength(2);
+      expect(humans.map((human) => human.displayName)).toEqual(["George", "Henry"]);
+      expect(humans.map((human) => human.locationModuleId)).toEqual([
+        "habitat_test_123_command_module_1",
+        "habitat_test_123_command_module_1",
+      ]);
+
       const list = await runCommand(["module", "list"]);
       expect(list.exitCode).toBe(0);
       expect(list.stdout).toContain("Local modules: module instances currently owned by this habitat.");
@@ -673,6 +715,45 @@ describe("habitat CLI", () => {
       expect(list.stdout).toContain("Command Module");
       expect(list.stdout).toContain("Workshop Fabricator");
       expect(list.stdout).toContain("Basic Suitport");
+
+      const humanList = await runCommand(["human", "list"]);
+      expect(humanList.exitCode).toBe(0);
+      expect(humanList.stdout).toContain("Local humans: starter crew currently assigned to habitat modules.");
+      expect(humanList.stdout).toContain("Ref");
+      expect(humanList.stdout).toContain("Display Name");
+      expect(humanList.stdout).toContain("Module ID");
+      expect(humanList.stdout).toContain("George");
+      expect(humanList.stdout).toContain("Henry");
+    });
+  });
+
+  test("fresh registration hydrates starter modules and humans through the CLI commands", async () => {
+    installMockFetch();
+
+    await withWorkspace(async () => {
+      const unregister = await runCommand(["unregister"]);
+      expect(unregister.exitCode).toBe(0);
+      expect(unregister.stdout).toContain("Not registered with Kepler.");
+
+      const register = await runCommand(["register", "--name", "Adrians Land"]);
+      expect(register.exitCode).toBe(0);
+      expect(register.stdout).toContain("Registered with Kepler.");
+
+      const status = await runCommand(["status"]);
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("Modules");
+      expect(status.stdout).toContain("6");
+
+      const moduleList = await runCommand(["module", "list"]);
+      expect(moduleList.exitCode).toBe(0);
+      expect(moduleList.stdout).toContain("Command Module");
+      expect(moduleList.stdout).toContain("Basic Suitport");
+
+      const humanList = await runCommand(["human", "list"]);
+      expect(humanList.exitCode).toBe(0);
+      expect(humanList.stdout).toContain("George");
+      expect(humanList.stdout).toContain("Henry");
+      expect(humanList.stdout).toContain("habitat_test_123_command_module_1");
     });
   });
 

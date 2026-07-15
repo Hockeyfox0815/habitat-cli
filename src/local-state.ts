@@ -3,6 +3,27 @@ import { join } from "node:path";
 import type { InventoryStore } from "./construction";
 import type { ModuleRecord } from "./power";
 
+export type StarterHumanRecord = {
+  id: string;
+  displayName: string;
+  locationModuleId: string;
+};
+
+export type HabitatAlertContractRecord = {
+  schemaVersion: string;
+  schema: Record<string, unknown>;
+};
+
+export type HabitatContractsRecord = {
+  alerts: HabitatAlertContractRecord;
+};
+
+export type HabitatStateBootstrap = {
+  registration: RegistrationRecord;
+  modules: ModuleRecord[];
+  humans: StarterHumanRecord[];
+};
+
 export type RegistrationRecord = {
   habitatUuid: string;
   displayName: string;
@@ -12,6 +33,8 @@ export type RegistrationRecord = {
   registeredAt: string;
   lastSyncedAt: string;
   starterModules: ModuleRecord[];
+  starterHumans?: StarterHumanRecord[];
+  contracts?: HabitatContractsRecord;
   blueprints: unknown[];
   lastStatus?: unknown;
 };
@@ -27,6 +50,12 @@ function getDatabase() {
     CREATE TABLE IF NOT EXISTS modules (
       sort_order INTEGER PRIMARY KEY,
       module_id TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS humans (
+      sort_order INTEGER PRIMARY KEY,
+      human_id TEXT NOT NULL UNIQUE,
       record_json TEXT NOT NULL
     );
 
@@ -71,6 +100,34 @@ export async function writeRegistration(record: RegistrationRecord) {
   });
 }
 
+export async function writeHabitatState({ registration, modules, humans }: HabitatStateBootstrap) {
+  withDatabase((database) => {
+    const insertModule = database.query(
+      "INSERT INTO modules (sort_order, module_id, record_json) VALUES (?1, ?2, ?3)",
+    );
+    const insertHuman = database.query(
+      "INSERT INTO humans (sort_order, human_id, record_json) VALUES (?1, ?2, ?3)",
+    );
+
+    database.transaction(() => {
+      database.query("INSERT OR REPLACE INTO registration (storage_key, record_json) VALUES (?1, ?2)").run(
+        "current",
+        JSON.stringify(registration),
+      );
+      database.exec("DELETE FROM modules");
+      database.exec("DELETE FROM humans");
+
+      modules.forEach((module, index) => {
+        insertModule.run(index, module.id, JSON.stringify(module));
+      });
+
+      humans.forEach((human, index) => {
+        insertHuman.run(index, human.id, JSON.stringify(human));
+      });
+    })();
+  });
+}
+
 export async function removeRegistration() {
   withDatabase((database) => {
     database.query("DELETE FROM registration WHERE storage_key = ?1").run("current");
@@ -106,6 +163,38 @@ export async function writeModules(modules: ModuleRecord[]) {
 export async function removeModules() {
   withDatabase((database) => {
     database.exec("DELETE FROM modules");
+  });
+}
+
+export async function readHumans() {
+  return withDatabase((database) => {
+    const rows = database
+      .query("SELECT record_json FROM humans ORDER BY sort_order ASC")
+      .all() as Array<{ record_json: string }>;
+
+    return rows.map((row) => JSON.parse(row.record_json) as StarterHumanRecord);
+  });
+}
+
+export async function writeHumans(humans: StarterHumanRecord[]) {
+  withDatabase((database) => {
+    const insert = database.query(
+      "INSERT INTO humans (sort_order, human_id, record_json) VALUES (?1, ?2, ?3)",
+    );
+
+    database.transaction(() => {
+      database.exec("DELETE FROM humans");
+
+      humans.forEach((human, index) => {
+        insert.run(index, human.id, JSON.stringify(human));
+      });
+    })();
+  });
+}
+
+export async function removeHumans() {
+  withDatabase((database) => {
+    database.exec("DELETE FROM humans");
   });
 }
 

@@ -1,14 +1,26 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { InventoryStore } from "./construction";
+import type {
+  BlueprintCatalogResponse,
+  BlueprintResponse,
+  Habitat,
+  HabitatRegistrationResponse,
+  HabitatResponse,
+  ResourceCatalogResponse,
+} from "./api-client";
 import {
+  readHumans,
   readInventory,
   readModules,
   readRegistration,
   removeInventory,
+  removeHumans,
   removeModules,
   removeRegistration,
+  writeHabitatState,
   writeInventory,
+  writeHumans,
   writeModules,
   writeRegistration,
   type RegistrationRecord,
@@ -17,38 +29,6 @@ import type { ModuleRecord } from "./power";
 import type { WorldScanResponse } from "./scan";
 
 const DEFAULT_KEPLER_BASE_URL = "https://planet.turingguild.com";
-
-type Habitat = {
-  id: string;
-  habitatSlug: string;
-  displayName: string;
-  catalogVersion: string;
-  status: string;
-  lastSeenAt?: string | null;
-};
-
-type HabitatRegistrationResponse = {
-  habitatId: string;
-  starterModules: ModuleRecord[];
-  blueprints: unknown[];
-  apiToken?: string;
-};
-
-type HabitatResponse = {
-  habitat: Habitat;
-};
-
-type BlueprintCatalogResponse = {
-  blueprints: unknown[];
-};
-
-type BlueprintResponse = {
-  blueprint: unknown;
-};
-
-type ResourceCatalogResponse = {
-  resources: unknown[];
-};
 
 class KeplerHttpError extends Error {
   constructor(
@@ -178,6 +158,22 @@ export function createHabitatApp() {
     return c.json(toRegistrationResponse(payload.registration));
   });
 
+  app.put("/registration/bootstrap", async (c) => {
+    const payload = (await c.req.json()) as {
+      registration: RegistrationRecord;
+      modules: ModuleRecord[];
+      humans: { id: string; displayName: string; locationModuleId: string }[];
+    };
+
+    await writeHabitatState({
+      registration: payload.registration,
+      modules: payload.modules ?? [],
+      humans: payload.humans ?? [],
+    });
+    logHabitatApi("PUT", "/registration/bootstrap", "saved registration, modules, and humans");
+    return c.json(toRegistrationResponse(payload.registration));
+  });
+
   app.delete("/registration", async (c) => {
     await removeRegistration();
     logHabitatApi("DELETE", "/registration", "cleared registration");
@@ -201,6 +197,25 @@ export function createHabitatApp() {
     await removeModules();
     logHabitatApi("DELETE", "/modules", "cleared modules");
     return c.json({ modules: [] });
+  });
+
+  app.get("/humans", async (c) => {
+    const humans = await readHumans();
+    logHabitatApi("GET", "/humans", `${humans.length} humans`);
+    return c.json({ humans });
+  });
+
+  app.put("/humans", async (c) => {
+    const payload = (await c.req.json()) as { humans: { id: string; displayName: string; locationModuleId: string }[] };
+    await writeHumans(payload.humans ?? []);
+    logHabitatApi("PUT", "/humans", `${(payload.humans ?? []).length} humans saved`);
+    return c.json({ humans: payload.humans ?? [] });
+  });
+
+  app.delete("/humans", async (c) => {
+    await removeHumans();
+    logHabitatApi("DELETE", "/humans", "cleared humans");
+    return c.json({ humans: [] });
   });
 
   app.get("/inventory", async (c) => {

@@ -13,10 +13,12 @@ import {
   type ConstructionJob,
 } from "./construction";
 import {
+  bootstrapRegistration,
   readBlueprint,
   readBlueprintCatalog,
   readHabitatStatus,
   getApiBaseUrl,
+  readHumans,
   readInventory,
   readModules,
   readRegistration,
@@ -30,10 +32,12 @@ import {
   ApiClientError,
   unregisterHabitat,
   writeInventory,
+  removeHumans,
   writeModules,
   writeRegistration,
   type Habitat,
   type RegistrationRecord,
+  type StarterHumanRecord,
   type ResourceCatalogEntry,
 } from "./api-client";
 import { findModuleByReference, getModuleReference } from "./module-refs";
@@ -161,6 +165,7 @@ function printRegistration(record: RegistrationRecord) {
   writeStdout(`Base URL: ${record.baseUrl}`);
   writeStdout(`Registered At: ${record.registeredAt}`);
   writeStdout(`Starter Modules: ${record.starterModules.length}`);
+  writeStdout(`Starter Humans: ${record.starterHumans?.length ?? 0}`);
   writeStdout(`Blueprints: ${record.blueprints.length}`);
 }
 
@@ -254,6 +259,34 @@ function printModuleDetails(module: ModuleRecord, modules: ModuleRecord[]) {
     writeStdout(`Remaining Ticks: ${constructionJob.remainingTicks}/${constructionJob.buildTicks}`);
   }
   writeStdout(`Runtime Attributes: ${JSON.stringify(module.runtimeAttributes, null, 2)}`);
+}
+
+function printHumanList(humans: StarterHumanRecord[]) {
+  const rows = humans.map((human, index) => ({
+    reference: `human-${index + 1}`,
+    id: human.id,
+    name: human.displayName,
+    moduleId: human.locationModuleId,
+  }));
+
+  const refWidth = Math.max("Ref".length, ...rows.map((row) => row.reference.length));
+  const idWidth = Math.max("ID".length, ...rows.map((row) => row.id.length));
+  const nameWidth = Math.max("Display Name".length, ...rows.map((row) => row.name.length));
+  const moduleWidth = Math.max("Module ID".length, ...rows.map((row) => row.moduleId.length));
+
+  writeStdout("Local humans: starter crew currently assigned to habitat modules.");
+  writeStdout(
+    `${"Ref".padEnd(refWidth)}  ${"ID".padEnd(idWidth)}  ${"Display Name".padEnd(nameWidth)}  ${"Module ID".padEnd(moduleWidth)}`,
+  );
+  writeStdout(
+    `${"-".repeat(refWidth)}  ${"-".repeat(idWidth)}  ${"-".repeat(nameWidth)}  ${"-".repeat(moduleWidth)}`,
+  );
+
+  for (const row of rows) {
+    writeStdout(
+      `${row.reference.padEnd(refWidth)}  ${row.id.padEnd(idWidth)}  ${row.name.padEnd(nameWidth)}  ${row.moduleId.padEnd(moduleWidth)}`,
+    );
+  }
 }
 
 function formatNumber(value: number) {
@@ -566,16 +599,16 @@ program
       registeredAt: now,
       lastSyncedAt: now,
       starterModules: response.starterModules,
+      starterHumans: response.starterHumans,
+      contracts: response.contracts,
       blueprints: response.blueprints,
     };
 
-    try {
-      await writeModules(response.starterModules);
-      await writeRegistration(record);
-    } catch (error) {
-      await removeModules();
-      throw error;
-    }
+    await bootstrapRegistration({
+      registration: record,
+      modules: response.starterModules,
+      humans: response.starterHumans,
+    });
 
     writeStdout("Registered with Kepler.");
     printRegistration(record);
@@ -620,8 +653,26 @@ program
     await unregisterHabitat(record.habitatId);
     await removeRegistration();
     await removeModules();
+    await removeHumans();
     await removeInventory();
     writeStdout(`Unregistered "${record.displayName}" from Kepler.`);
+  });
+
+const humanCommand = program.command("human").description("Manage local starter humans.");
+
+humanCommand
+  .command("list")
+  .description("List local humans.")
+  .action(async () => {
+    await requireRegistration();
+    const humans = await readHumans();
+
+    if (humans.length === 0) {
+      writeStdout("No humans found.");
+      return;
+    }
+
+    printHumanList(humans);
   });
 
 program
